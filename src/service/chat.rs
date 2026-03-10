@@ -1,0 +1,188 @@
+use anyhow::Result;
+use std::sync::Arc;
+use uuid::Uuid;
+
+use crate::{
+    connections::ConnectionManager,
+    models::message::Message,
+    proto::ridehailing::{
+        server_event::Payload as Sp, MessageAckEvent, NewMessageEvent, ReadReceiptEvent,
+        ServerEvent,
+    },
+    repository::message::MessageRepository,
+};
+
+pub struct ChatService {
+    pub msg_repo: Arc<MessageRepository>,
+    pub connections: Arc<ConnectionManager>,
+}
+
+impl ChatService {
+    /// Kirim pesan teks
+    pub async fn send_text(
+        &self,
+        sender_id: &str,
+        recipient_id: &str,
+        content: &str,
+        sender: &str,
+    ) -> Result<()> {
+        if sender_id == recipient_id {
+            anyhow::bail!("Tidak bisa mengirim pesan ke diri sendiri");
+        }
+
+        let mut msg = Message {
+            id: Uuid::new_v4().to_string(),
+            sender_id: sender_id.to_string(),
+            recipient_id: recipient_id.to_string(),
+            content: content.to_string(),
+            msg_type: "text".to_string(),
+            media_url: None,
+            media_mime: None,
+            media_size: None,
+            media_duration: None,
+            media_thumb: None,
+            sent_at: chrono::Utc::now()
+                .format("%Y-%m-%d %H:%M:%S%.3f")
+                .to_string(),
+            delivered_at: None,
+            read_at: None,
+            sender_avatar: None,
+            sender_name: None,
+        };
+
+        self.msg_repo.save(&mut msg).await?;
+        self.push_message(&msg, sender).await;
+        Ok(())
+    }
+
+    /// Kirim pesan media
+    pub async fn send_media(
+        &self,
+        sender_id: &str,
+        recipient_id: &str,
+        caption: &str,
+        media_url: &str,
+        media_mime: &str,
+        media_size: i64,
+        media_duration: i32,
+        media_thumb: &str,
+        sender: &str,
+    ) -> Result<()> {
+        let msg_type = mime_to_type(media_mime);
+
+        let mut msg = Message {
+            id: Uuid::new_v4().to_string(),
+            sender_id: sender_id.to_string(),
+            recipient_id: recipient_id.to_string(),
+            content: caption.to_string(),
+            msg_type: msg_type.to_string(),
+            media_url: Some(media_url.to_string()),
+            media_mime: Some(media_mime.to_string()),
+            media_size: (media_size > 0).then_some(media_size),
+            media_duration: (media_duration > 0).then_some(media_duration),
+            media_thumb: (!media_thumb.is_empty()).then_some(media_thumb.to_string()),
+            sent_at: chrono::Utc::now()
+                .format("%Y-%m-%d %H:%M:%S%.3f")
+                .to_string(),
+            delivered_at: None,
+            read_at: None,
+            sender_avatar: None,
+            sender_name: None,
+        };
+
+        self.msg_repo.save(&mut msg).await?;
+        self.push_message(&msg, sender).await;
+        Ok(())
+    }
+
+    /// Mark pesan dari sender sebagai sudah dibaca
+    pub async fn mark_read(&self, reader_id: &str, sender_id: &str) -> Result<()> {
+        self.msg_repo.mark_read(reader_id, sender_id).await?;
+
+        // Notify sender bahwa pesannya sudah dibaca
+        let read_at = chrono::Utc::now()
+            .format("%Y-%m-%d %H:%M:%S%.3f")
+            .to_string();
+        self.connections.send(
+            sender_id,
+            ServerEvent {
+                payload: Some(Sp::ReadReceipt(ReadReceiptEvent {
+                    from_user_id: reader_id.to_string(),
+                    read_at,
+                })),
+            },
+        );
+        Ok(())
+    }
+
+    /// Ambil history pesan antara dua user
+    pub async fn get_history(
+        &self,
+        user_id: &str,
+        peer_id: &str,
+        limit: i32,
+        before: Option<&str>,
+    ) -> Result<Vec<Message>> {
+        let limit = if limit <= 0 || limit > 100 { 50 } else { limit };
+        let msgs = self
+            .msg_repo
+            .get_history(user_id, peer_id, limit, before)
+            .await?;
+
+        Ok(msgs)
+    }
+
+    // ── Internal ──────────────────────────────────────────────────────────────
+
+    async fn push_message(&self, msg: &Message, sender_name: &str) {
+        let event = ServerEvent {
+            payload: Some(Sp::NewMessage(NewMessageEvent {
+                msg_id: msg.id.clone(),
+                sender_id: msg.sender_id.clone(),
+                sender_name: sender_name.to_string(),
+                recipient_id: msg.recipient_id.clone(),
+                content: msg.content.clone(),
+                msg_type: msg.msg_type.clone(),
+                sent_at: msg.sent_at.clone(),
+                media_url: msg.media_url.clone().unwrap_or_default(),
+                media_mime: msg.media_mime.clone().unwrap_or_default(),
+                media_size: msg.media_size.unwrap_or(0),
+                media_duration: msg.media_duration.unwrap_or(0),
+                media_thumb: msg.media_thumb.clone().unwrap_or_default(),
+                sender_avatar: msg.sender_avatar.clone().unwrap_or_default(),
+            })),
+        };
+
+        // Push ke recipient
+        self.connections.send(&msg.recipient_id, event.clone());
+
+        // Ack ke sender
+        self.connections.send(
+            &msg.sender_id,
+            ServerEvent {
+                payload: Some(Sp::MessageAck(MessageAckEvent {
+                    msg_id: msg.id.clone(),
+                    status: "sent".to_string(),
+                    sent_at: msg.sent_at.clone(),
+                })),
+            },
+        );
+
+        // Mark delivered kalau recipient online
+        if self.connections.is_connected(&msg.recipient_id).await {
+            let _ = self.msg_repo.mark_delivered(&msg.id).await;
+        }
+    }
+}
+
+fn mime_to_type(mime: &str) -> &'static str {
+    if mime.starts_with("image/") {
+        "image"
+    } else if mime.starts_with("audio/") {
+        "audio"
+    } else if mime.starts_with("video/") {
+        "video"
+    } else {
+        "file"
+    }
+}
