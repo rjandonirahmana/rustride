@@ -9,9 +9,10 @@ use crate::{
     location::LocationService,
     proto::ridehailing::{
         app_service_server::AppService, client_event::Payload as Cp, server_event::Payload as Sp,
-        ClientEvent, ConnectedEvent, ErrorEvent, HistoryEvent, NearbyOrderItem, NearbyOrdersEvent,
-        NearbyRideshareEvent, NewMessageEvent, OrderCreatedEvent, PongEvent, PresenceEvent,
-        RideshareJoinedEvent, RideshareOpenedEvent, ServerEvent,
+        ClientEvent, ConnectedEvent, DriverInfo, ErrorEvent, HistoryEvent, NearbyOrderItem,
+        NearbyOrdersEvent, NearbyRideshareEvent, NewMessageEvent, OrderCreatedEvent,
+        OrderStatusEvent, PongEvent, PresenceEvent, RideshareJoinedEvent, RideshareOpenedEvent,
+        ServerEvent,
     },
     repository::{
         notification::NotificationRepositorytrait, order::OrderRepository,
@@ -84,8 +85,6 @@ where
         let user_id = claims.sub.clone();
         let role = claims.role.clone();
 
-        tracing::info!(user_id = %user_id, role = %role, "gRPC stream opened");
-
         // ── 2. Register channel server→client ─────────────────────────────────
         let event_rx = self.connections.connect(&user_id).await;
 
@@ -95,6 +94,8 @@ where
         } else if role == "rider" {
             self.connections.register_rider(&user_id).await;
         }
+
+        tracing::info!("userid {} connect {}", &user_id, &role);
 
         self.connections.send(
             &user_id,
@@ -106,13 +107,65 @@ where
                 })),
             },
         );
+        let uid = user_id.clone();
+
+        if role == "rider" {
+            // ── 2b. Auto-push active order saat connect / reconnect ──────────────────
+
+            let order_svc2 = self.order_svc.clone();
+            let connections2 = self.connections.clone();
+            let user_repo2 = self.user_repo.clone();
+            let uid2 = user_id.clone();
+
+            tokio::spawn(async move {
+                let order = match order_svc2.get_active_order_for_user(&uid2).await {
+                    Ok(Some(o)) => o,
+                    Ok(None) => return, // tidak ada order aktif, skip
+                    Err(e) => {
+                        tracing::warn!(user_id = %uid2, "Gagal fetch active order on connect: {}", e);
+                        return;
+                    }
+                };
+
+                // Ambil info driver kalau order sudah di-assign
+                let driver_info = if let Some(ref driver_id) = order.driver_id {
+                    match user_repo2.find_driver_by_id(driver_id).await {
+                        Ok(Some((user, profile))) => Some(DriverInfo {
+                            user_id: driver_id.clone(),
+                            name: user.name,
+                            phone: user.phone,
+                            vehicle_plate: profile.vehicle_plate,
+                            vehicle_model: profile.vehicle_model,
+                            vehicle_color: profile.vehicle_color,
+                            rating: profile.rating,
+                        }),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+
+                connections2.send(
+                    &uid2,
+                    ServerEvent {
+                        payload: Some(Sp::OrderStatus(OrderStatusEvent {
+                            order_id: order.id,
+                            status: order.status,
+                            driver: driver_info,
+                            fare_estimate: order.fare_estimate,
+                            service_type: order.service_type,
+                        })),
+                    },
+                );
+            });
+        }
 
         // ── 3. Spawn reader task — client → server ────────────────────────────
         let order_svc = self.order_svc.clone();
         let connections = self.connections.clone();
         let user_repo = self.user_repo.clone();
         let location = self.location.clone();
-        let uid = user_id.clone();
+
         let role_r = role.clone();
         let mut in_stream = request.into_inner();
         let name = claims.name.clone();
@@ -165,17 +218,6 @@ where
                 let _ = user_repo.set_driver_active(&uid, false).await;
                 let _ = location.remove_driver(&uid, "motor").await;
                 let _ = location.remove_driver(&uid, "mobil").await;
-
-                // ── Auto cancel jika driver disconnect saat order masih berlangsung ─
-                match order_svc.cancel_active_order_on_disconnect(&uid).await {
-                    Ok(Some(order_id)) => {
-                        tracing::info!(user_id = %uid, order_id = %order_id, "Order auto-cancelled karena driver disconnect");
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        tracing::error!(user_id = %uid, "Gagal cancel order saat disconnect: {}", e);
-                    }
-                }
             }
         });
 
@@ -210,20 +252,28 @@ async fn dispatch<OR, UR, NR, RR>(
     };
 
     match payload {
+        Cp::GetMessageReq(_) => match chat_svc.get_conversations(user_id).await {
+            Ok(data) => {
+                connections.send(
+                    user_id,
+                    ServerEvent {
+                        payload: Some(Sp::ConversationItems(
+                            crate::proto::ridehailing::ConversationItems { items: data },
+                        )),
+                    },
+                );
+            }
+
+            Err(e) => {
+                connections.send(user_id, err_event("FIND_MESSAGE_ERROR", &e.to_string()));
+            }
+        },
         // ── Rider: watch driver aktif di sekitar ──────────────────────────────
         Cp::WatchDrivers(req) => {
             if role != "rider" {
                 connections.send(user_id, err_event("FORBIDDEN", "Hanya rider"));
                 return;
             }
-
-            tracing::info!(
-                user_id = %user_id,
-                lat = %req.lat,
-                lng = %req.lng,
-                service_type = %req.service_type,
-                "WatchDrivers request"
-            );
 
             match location
                 .find_nearby_drivers(req.lat, req.lng, &req.service_type)
@@ -526,7 +576,7 @@ async fn dispatch<OR, UR, NR, RR>(
             // ──────────────────────────────────────────────────────────────────
 
             if let Err(e) = chat_svc
-                .send_text(user_id, &m.recipient_id, &m.content, username)
+                .send_text(user_id, &m.recipient_id, &m.content, username, &order.id)
                 .await
             {
                 tracing::error!(error = %e, "send_text failed {:?}", e);
@@ -544,18 +594,31 @@ async fn dispatch<OR, UR, NR, RR>(
                 return;
             }
 
+            let order = match order_svc.order_repo.find_by_id(&m.order_id).await {
+                Ok(Some(o)) => o, // Menghasilkan Order
+                Ok(None) => {
+                    connections.send(user_id, err_event("ACTIVE_ORDER_FAILED", "order not found"));
+                    return; // Keluar dari fungsi, jadi match tidak perlu mengembalikan nilai
+                }
+                Err(e) => {
+                    connections.send(user_id, err_event("ACTIVE_ORDER_FAILED", &e.to_string()));
+                    return; // Keluar dari fungsi
+                }
+            };
+
+            // ── Cek order aktif antara rider & driver ──────────────────────────
             let allowed = match role {
                 "rider" => {
                     // Rider harus punya order aktif dengan driver tersebut
-                    order_svc
-                        .has_active_order_with(user_id, &m.recipient_id)
-                        .await
+                    order.rider_id == user_id
                 }
                 "driver" => {
                     // Driver harus punya order aktif dengan rider tersebut
-                    order_svc
-                        .has_active_order_with(&m.recipient_id, user_id)
-                        .await
+                    if let Some(driver) = order.driver_id {
+                        driver == user_id
+                    } else {
+                        false
+                    }
                 }
                 _ => false,
             };
@@ -582,6 +645,7 @@ async fn dispatch<OR, UR, NR, RR>(
                     m.media_duration,
                     &m.media_thumb,
                     username,
+                    &order.id,
                 )
                 .await
             {
@@ -637,6 +701,7 @@ async fn dispatch<OR, UR, NR, RR>(
                             media_duration: m.media_duration.unwrap_or(0),
                             media_thumb: m.media_thumb.clone().unwrap_or_default(),
                             sender_avatar: m.sender_avatar.clone().unwrap_or_default(),
+                            status_order: m.status_order.clone().unwrap_or_default(),
                         })
                         .collect();
                     connections.send(

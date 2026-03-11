@@ -6,8 +6,8 @@ use crate::{
     connections::ConnectionManager,
     models::message::Message,
     proto::ridehailing::{
-        server_event::Payload as Sp, MessageAckEvent, NewMessageEvent, ReadReceiptEvent,
-        ServerEvent,
+        server_event::Payload as Sp, ConversationItem, MessageAckEvent, NewMessageEvent,
+        ReadReceiptEvent, ServerEvent,
     },
     repository::message::MessageRepository,
 };
@@ -25,6 +25,7 @@ impl ChatService {
         recipient_id: &str,
         content: &str,
         sender: &str,
+        order_id: &str,
     ) -> Result<()> {
         if sender_id == recipient_id {
             anyhow::bail!("Tidak bisa mengirim pesan ke diri sendiri");
@@ -48,6 +49,8 @@ impl ChatService {
             read_at: None,
             sender_avatar: None,
             sender_name: None,
+            order_id: order_id.to_string(),
+            status_order: None,
         };
 
         self.msg_repo.save(&mut msg).await?;
@@ -67,6 +70,7 @@ impl ChatService {
         media_duration: i32,
         media_thumb: &str,
         sender: &str,
+        order_id: &str,
     ) -> Result<()> {
         let msg_type = mime_to_type(media_mime);
 
@@ -88,11 +92,17 @@ impl ChatService {
             read_at: None,
             sender_avatar: None,
             sender_name: None,
+            order_id: order_id.to_string(),
+            status_order: None,
         };
 
         self.msg_repo.save(&mut msg).await?;
         self.push_message(&msg, sender).await;
         Ok(())
+    }
+
+    pub async fn get_conversations(&self, user_id: &str) -> Result<Vec<ConversationItem>> {
+        self.msg_repo.get_conversations(user_id).await
     }
 
     /// Mark pesan dari sender sebagai sudah dibaca
@@ -150,6 +160,7 @@ impl ChatService {
                 media_duration: msg.media_duration.unwrap_or(0),
                 media_thumb: msg.media_thumb.clone().unwrap_or_default(),
                 sender_avatar: msg.sender_avatar.clone().unwrap_or_default(),
+                status_order: msg.status_order.clone().unwrap_or_default(),
             })),
         };
 

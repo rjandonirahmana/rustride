@@ -1,8 +1,8 @@
 use anyhow::Result;
-use mysql_async::{from_value, Row};
+use mysql_async::{from_value, prelude::Queryable, Row};
 
 use super::db::{col, col_opt_i32, col_opt_i64, col_opt_str, exec_drop, exec_rows};
-use crate::models::message::Message;
+use crate::{models::message::Message, proto::ridehailing::ConversationItem};
 use mysql_async::Pool;
 
 pub struct MessageRepository {
@@ -31,26 +31,29 @@ impl MessageRepository {
             read_at: col_opt_str(row, "read_at"),
             sender_avatar: col_opt_str(row, "sender_avatar"),
             sender_name: col_opt_str(row, "sender_name"),
+            order_id: from_value(col(row, "order_id")?),
+            status_order: from_value(col(row, "status_order")?),
         })
     }
 
     fn msg_cols() -> &'static str {
-        r"m.id, m.sender_id, m.recipient_id, m.content, m.msg_type,
+        r"m.id, m.sender_id, m.recipient_id, m.content, m.msg_type, m.order_id as order_id,
           m.media_url, m.media_mime, m.media_size, m.media_duration, m.media_thumb,
-          IFNULL(DATE_FORMAT(m.sent_at, '%Y-%m-%dT%H:%i:%sZ'), '0001-01-01T00:00:00Z') AS sent_at, IFNULL(DATE_FORMAT(m.delivered_at, '%Y-%m-%dT%H:%i:%sZ'), '0001-01-01T00:00:00Z') AS delivered_at, IFNULL(DATE_FORMAT(m.read_at, '%Y-%m-%dT%H:%i:%sZ'), '0001-01-01T00:00:00Z') AS read_at, u.name AS sender_name, u.avatar_url AS sender_avatar"
+          IFNULL(DATE_FORMAT(m.sent_at, '%Y-%m-%dT%H:%i:%sZ'), '0001-01-01T00:00:00Z') AS sent_at, IFNULL(DATE_FORMAT(m.delivered_at, '%Y-%m-%dT%H:%i:%sZ'), '0001-01-01T00:00:00Z') AS delivered_at, IFNULL(DATE_FORMAT(m.read_at, '%Y-%m-%dT%H:%i:%sZ'), '0001-01-01T00:00:00Z') AS read_at, u.name AS sender_name, u.avatar_url AS sender_avatar, IFNULL(o.status, '') as status_order"
     }
 
     pub async fn save(&self, msg: &mut Message) -> Result<()> {
         exec_drop(
             &self.pool,
             r"INSERT INTO messages
-              (id, sender_id, recipient_id, content, msg_type,
+              (id, sender_id, recipient_id, order_id, content, msg_type,
                media_url, media_mime, media_size, media_duration, media_thumb, sent_at)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 &msg.id,
                 &msg.sender_id,
                 &msg.recipient_id,
+                &msg.order_id,
                 &msg.content,
                 &msg.msg_type,
                 &msg.media_url,
@@ -64,6 +67,76 @@ impl MessageRepository {
         .await
     }
 
+    pub async fn get_conversations(&self, user_id: &str) -> Result<Vec<ConversationItem>> {
+        let q = r"
+    SELECT
+        peer_id,
+        peer_name,
+        peer_avatar,
+        last_message,
+        last_msg_type,
+        last_sent_at,
+        order_id,
+        order_status,
+        (
+            SELECT COUNT(*) 
+            FROM messages 
+            WHERE recipient_id = ? AND sender_id = peer_id AND read_at IS NULL
+        ) AS unread_count
+    FROM (
+        SELECT
+            CASE
+                WHEN m.sender_id = ? THEN m.recipient_id
+                ELSE m.sender_id
+            END AS peer_id,
+            IFNULL(u.name, '') AS peer_name,
+            IFNULL(u.avatar_url, '') AS peer_avatar,
+            IFNULL(m.content, '') AS last_message,
+            IFNULL(m.msg_type, '') AS last_msg_type,
+            IFNULL(DATE_FORMAT(m.sent_at, '%Y-%m-%dT%H:%i:%sZ'), '0001-01-01T00:00:00Z') AS last_sent_at,
+            m.order_id,
+            IFNULL(o.status, '') as order_status,
+            ROW_NUMBER() OVER (
+                PARTITION BY CASE
+                    WHEN m.sender_id = ? THEN m.recipient_id
+                    ELSE m.sender_id
+                END
+                ORDER BY m.sent_at DESC
+            ) AS rn
+        FROM messages m
+        JOIN users u ON u.id = CASE
+            WHEN m.sender_id = ? THEN m.recipient_id
+            ELSE m.sender_id
+        END
+        JOIN orders o ON m.order_id = o.id
+        WHERE m.sender_id = ? OR m.recipient_id = ?
+    ) t
+    WHERE rn = 1
+    ORDER BY last_sent_at DESC
+";
+        let mut conn = self.pool.get_conn().await?;
+        // params sekarang 7: unread subquery user_id + 6 yang lama
+        let rows: Vec<Row> = conn
+            .exec(q, (user_id, user_id, user_id, user_id, user_id, user_id))
+            .await?;
+
+        rows.iter()
+            .map(|r| {
+                Ok(ConversationItem {
+                    peer_id: from_value(col(r, "peer_id")?),
+                    peer_name: from_value(col(r, "peer_name")?),
+                    peer_avatar: from_value(col(r, "peer_avatar")?),
+                    last_message: from_value(col(r, "last_message")?),
+                    last_message_type: from_value(col(r, "last_msg_type")?),
+                    last_seen_at: from_value(col(r, "last_sent_at")?),
+                    unread_count: from_value(col(r, "unread_count")?),
+                    order_id: from_value(col(r, "order_id")?),
+                    order_status: from_value(col(r, "order_status")?),
+                })
+            })
+            .collect()
+    }
+
     pub async fn get_history(
         &self,
         sender_id: &str,
@@ -72,7 +145,7 @@ impl MessageRepository {
         before_id: Option<&str>,
     ) -> Result<Vec<Message>> {
         let q = format!(
-            r"SELECT {} FROM messages m JOIN users u ON m.sender_id = u.id
+            r"SELECT {} FROM messages m JOIN users u ON m.sender_id = u.id JOIN orders o ON m.order_id = o.id
                   WHERE (m.sender_id = ? AND m.recipient_id = ?) OR (m.sender_id = ? AND m.recipient_id = ?)
                   ORDER BY m.sent_at DESC LIMIT ?",
             Self::msg_cols()

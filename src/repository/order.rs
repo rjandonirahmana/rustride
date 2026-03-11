@@ -184,7 +184,10 @@ impl OrderRepository for MySqlOrderRepository {
         let mut conn = self.pool.get_conn().await?;
         let row: Option<mysql_async::Row> = conn
             .exec_first(
-             format!("SELECT {} FROM orders o WHERE o.rider_id = ? AND o.status NOT IN ('completed', 'cancelled')", Self::order_cols()),
+                format!(
+                    "SELECT {} FROM orders o WHERE o.rider_id = ? AND o.status NOT IN ('completed', 'cancelled')",
+                    Self::order_cols()
+                ),
                 (rider_id,),
             )
             .await?;
@@ -251,6 +254,7 @@ impl OrderRepository for MySqlOrderRepository {
 
     async fn update_status(&self, order_id: &str, status: &str) -> Result<()> {
         let q = match status {
+            "rider_accepted" => "UPDATE orders SET status = ?, accepted_at = NOW(3) WHERE id = ?",
             "driver_accepted" => "UPDATE orders SET status = ?, accepted_at = NOW(3) WHERE id = ?",
             "driver_arrived" => "UPDATE orders SET status = ?, arrived_at = NOW(3) WHERE id = ?",
             "on_trip" => "UPDATE orders SET status = ?, started_at = NOW(3) WHERE id = ?",

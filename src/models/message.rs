@@ -5,6 +5,7 @@ pub struct Message {
     pub id: String,
     pub sender_id: String,
     pub recipient_id: String,
+    pub order_id: String,
     pub content: String,
     pub msg_type: String,
     pub media_url: Option<String>,
@@ -17,4 +18,5 @@ pub struct Message {
     pub read_at: Option<String>,
     pub sender_name: Option<String>,
     pub sender_avatar: Option<String>,
+    pub status_order: Option<String>,
 }

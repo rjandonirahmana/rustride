@@ -82,6 +82,7 @@ message ClientEvent {
     GetNotificationsReq get_notifications   = 28; // ambil daftar notif
     MarkNotifReadReq    mark_notif_read     = 29; // tandai notif sudah dibaca
     MarkAllNotifReadReq mark_all_notif_read = 30;
+    MessageReq          get_message_req     = 31;
   }
 }
 
@@ -121,13 +122,34 @@ message ServerEvent {
     // ── notifications ──
     NotificationsEvent   notifications    = 23; // list notif
     NewNotificationEvent new_notification = 24; // push notif baru (realtime)
+    ConversationItems    conversation_items = 25;
   }
+}
+
+message ConversationItem {
+  string peer_id = 1;
+  string peer_name = 2;
+  string peer_avatar = 3;
+  string last_message = 4;
+  string last_message_type = 5;
+  string last_seen_at = 6;
+  uint32 unread_count = 7;
+  string order_id = 8;
+  string order_status      = 9; // ← tambah ini
+
+  
+} 
+
+message ConversationItems  {
+  repeated ConversationItem items = 1;
 }
 
 // ══════════════════════════════════════════════════════════════
 //  Shared
 // ══════════════════════════════════════════════════════════════
 message PingReq        {}
+
+message MessageReq        {}
 
 message PongEvent      {}
 
@@ -210,7 +232,8 @@ message NewOrderOffer {
   uint32 timeout_secs         = 4;
 }
 
-message OrderStatusEvent    { string order_id = 1; string status = 2; DriverInfo driver = 3; }
+message OrderStatusEvent    { string order_id = 1; string status = 2; DriverInfo driver = 3;  string service_type = 4; // tambah
+  int32  fare_estimate = 5; }
 
 message DriverLocationEvent { string order_id = 1; double lat = 2; double lng = 3; float heading = 4; }
 
@@ -253,6 +276,7 @@ message SendMediaReq {
   int64  media_size     = 5;
   int32  media_duration = 6;
   string media_thumb    = 7;
+  string order_id = 8;
 }
 
 message MarkReadReq       { string from_user_id   = 1; }
@@ -281,6 +305,7 @@ message NewMessageEvent {
   int32  media_duration = 11;
   string media_thumb    = 12;
   string sender_avatar  = 13;
+  string status_order = 14;
 }
 
 message MessageAckEvent  { string msg_id = 1; string status = 2; string sent_at = 3; }

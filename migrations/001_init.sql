@@ -93,6 +93,7 @@ CREATE TABLE IF NOT EXISTS messages (
     id            VARCHAR(100)   NOT NULL,
     sender_id     VARCHAR(36)   NOT NULL,
     recipient_id  VARCHAR(36)   NOT NULL,
+    order_id      VARCHAR(36)   NOT NULL,
     content       TEXT           NOT NULL,
     msg_type      VARCHAR(20)    NOT NULL DEFAULT 'text',
     media_url     VARCHAR(1000)  NULL,
@@ -110,7 +111,9 @@ CREATE TABLE IF NOT EXISTS messages (
     CONSTRAINT fk_messages_sender
         FOREIGN KEY (sender_id)    REFERENCES users(id) ON DELETE CASCADE,
     CONSTRAINT fk_messages_recipient
-        FOREIGN KEY (recipient_id) REFERENCES users(id) ON DELETE CASCADE
+        FOREIGN KEY (recipient_id) REFERENCES users(id) ON DELETE CASCADE,
+    CONSTRAINT fk_messages_order
+        FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE OR REPLACE VIEW conversations AS
