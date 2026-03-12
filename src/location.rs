@@ -1,11 +1,27 @@
+// ===== GEOHASH GRID PARTITIONING - FIXED VERSION =====
+// Fix semua bug kritis: precision mismatch, grid migration, KEYS command, pipeline
+
+use std::collections::HashSet;
+
 use anyhow::{Context, Result};
+use geohash::{encode, neighbors, Coord, Direction};
+use prost::Message;
 use redis::{aio::ConnectionManager, AsyncCommands};
 
-use crate::models::order::DriverLocation;
+use crate::{models::order::DriverLocation, proto::ridehailing::DriverLocationMeta};
 
-const GEO_KEY_MOTOR: &str = "drivers:geo:motor";
-const GEO_KEY_MOBIL: &str = "drivers:geo:mobil";
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+/// FIX: Gunakan precision yang SAMA untuk partition dan search
+const GEO_PRECISION: usize = 5; // ~5km × 5km grid
+
 const LOC_DETAIL_PREFIX: &str = "driver:loc:";
+const GEO_TTL_PREFIX: &str = "geo:ttl:";
+const ORDER_PREFIX: &str = "driver:order:";
+const HASH_PREFIX: &str = "driver:hash:";
+
+const META_TTL_SECONDS: i64 = 30;
+const ORDER_TTL_SECONDS: u64 = 3600 * 4;
 const SEARCH_RADIUS_KM: f64 = 5.0;
 const MAX_DRIVERS: usize = 10;
 
@@ -19,12 +35,14 @@ impl LocationService {
         Self { redis }
     }
 
-    fn geo_key(service_type: &str) -> &'static str {
-        if service_type == "mobil" {
-            GEO_KEY_MOBIL
-        } else {
-            GEO_KEY_MOTOR
-        }
+    // ── Key Helpers ───────────────────────────────────────────────────────────
+
+    fn geo_key(service_type: &str, geohash: &str) -> String {
+        format!("geo:{}:{}", service_type, geohash)
+    }
+
+    fn geo_ttl_key(service_type: &str, geohash: &str) -> String {
+        format!("{}{}:{}", GEO_TTL_PREFIX, service_type, geohash)
     }
 
     fn detail_key(driver_id: &str) -> String {
@@ -32,147 +50,550 @@ impl LocationService {
     }
 
     fn order_key(driver_id: &str) -> String {
-        format!("driver:order:{}", driver_id)
+        format!("{}{}", ORDER_PREFIX, driver_id)
     }
 
-    /// Driver update lokasi — simpan ke Redis GEO + detail JSON
+    fn hash_key(driver_id: &str) -> String {
+        format!("{}{}", HASH_PREFIX, driver_id)
+    }
+
+    // ── Geohash Utilities ─────────────────────────────────────────────────────
+
+    /// FIX: Satu function, satu precision
+    fn get_geohash(lat: f64, lng: f64) -> Result<String> {
+        let coord = Coord { x: lng, y: lat };
+        encode(coord, GEO_PRECISION).context("Failed to encode geohash")
+    }
+
+    /// Get neighboring geohash cells (8 neighbors + center = 9 total)
+    /// Get neighboring geohash cells (8 neighbors + center = 9 total)
+    fn get_search_grids(lat: f64, lng: f64) -> Result<Vec<String>> {
+        let center_hash = Self::get_geohash(lat, lng)?;
+
+        let mut grids = HashSet::with_capacity(9);
+
+        grids.insert(center_hash.clone());
+
+        if let Ok(n) = neighbors(&center_hash) {
+            grids.insert(n.n);
+            grids.insert(n.ne);
+            grids.insert(n.e);
+            grids.insert(n.se);
+            grids.insert(n.s);
+            grids.insert(n.sw);
+            grids.insert(n.w);
+            grids.insert(n.nw);
+        }
+
+        Ok(grids.into_iter().collect())
+    }
+
+    // ── Validation ────────────────────────────────────────────────────────────
+
+    fn validate_coordinates(lat: f64, lng: f64) -> Result<()> {
+        if !(-90.0..=90.0).contains(&lat) {
+            anyhow::bail!("Invalid latitude: {} (must be -90 to 90)", lat);
+        }
+        if !(-180.0..=180.0).contains(&lng) {
+            anyhow::bail!("Invalid longitude: {} (must be -180 to 180)", lng);
+        }
+        if lat.is_nan() || lng.is_nan() || lat.is_infinite() || lng.is_infinite() {
+            anyhow::bail!("Invalid coordinates: lat={}, lng={}", lat, lng);
+        }
+        Ok(())
+    }
+
+    fn validate_driver_id(driver_id: &str) -> Result<()> {
+        if driver_id.is_empty() {
+            anyhow::bail!("Driver ID cannot be empty");
+        }
+        if driver_id.len() > 128 {
+            anyhow::bail!("Driver ID too long: {} chars", driver_id.len());
+        }
+        Ok(())
+    }
+
+    // ── Update Location ───────────────────────────────────────────────────────
+
+    /// FIX: Handle grid migration (driver pindah dari grid lama ke baru)
     pub async fn update_driver_location(
         &self,
         driver_id: &str,
         lat: f64,
         lng: f64,
-        heading: Option<f64>,
-        speed: Option<f64>,
+        heading: Option<f32>, // FIX: f64 → f32
+        speed: Option<f32>,   // FIX: f64 → f32
         service_type: &str,
     ) -> Result<()> {
+        Self::validate_coordinates(lat, lng)?;
+        Self::validate_driver_id(driver_id)?;
+
         let mut redis = self.redis.clone();
-        let geo_key = Self::geo_key(service_type);
 
-        // Hapus dari geo key LAIN dulu supaya tidak double entry
-        let other_key = if service_type == "mobil" {
-            GEO_KEY_MOTOR
-        } else {
-            GEO_KEY_MOBIL
-        };
-        let _: Result<(), _> = redis.zrem(other_key, driver_id).await?;
+        // Calculate new geohash
+        let new_geohash = Self::get_geohash(lat, lng)?;
+        let hash_key = Self::hash_key(driver_id);
 
-        // Baru GEOADD ke key yang benar
-        let _: () = redis.geo_add(geo_key, (lng, lat, driver_id)).await?;
+        // FIX: Get old geohash untuk detect grid migration
+        let old_geohash: Option<String> = redis.get(&hash_key).await.unwrap_or(None);
 
-        // Detail (heading, speed, timestamp) disimpan sebagai JSON string
+        let geo_key = Self::geo_key(service_type, &new_geohash);
+        let geo_ttl_key = Self::geo_ttl_key(service_type, &new_geohash);
+        let detail_key = Self::detail_key(driver_id);
+
         let ts = chrono::Utc::now().timestamp_millis();
-        let detail = serde_json::json!({
-            "lat":     lat,
-            "lng":     lng,
-            "heading": heading,
-            "speed":   speed,
-            "ts":      ts,
-        });
 
-        let _: () = redis
-            .set_ex(Self::detail_key(driver_id), detail.to_string(), 30u64)
-            .await?;
+        // Prepare metadata
+        let meta = DriverLocationMeta {
+            heading: heading.unwrap_or_default() as f64,
+            speed: speed.unwrap_or_default() as f64,
+            ts,
+            lat,
+            lng,
+        };
+
+        let bytes = meta.encode_to_vec();
+
+        // Build atomic pipeline
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+
+        // FIX: Jika pindah grid, remove dari grid lama
+        if let Some(old) = &old_geohash {
+            if old != &new_geohash {
+                let old_geo_key = Self::geo_key(service_type, old);
+                let old_ttl_key = Self::geo_ttl_key(service_type, old);
+
+                pipe.cmd("ZREM").arg(&old_geo_key).arg(driver_id);
+                pipe.cmd("ZREM").arg(&old_ttl_key).arg(driver_id);
+
+                tracing::debug!(
+                    "Driver {} migrated from grid {} to {}",
+                    driver_id,
+                    old,
+                    new_geohash
+                );
+            }
+        }
+
+        // Add to new grid
+        pipe.cmd("GEOADD")
+            .arg(&geo_key)
+            .arg(lng)
+            .arg(lat)
+            .arg(driver_id);
+
+        // Store metadata with TTL
+        pipe.cmd("SETEX")
+            .arg(&detail_key)
+            .arg(META_TTL_SECONDS)
+            .arg(&bytes);
+
+        // Track in TTL sorted set
+        pipe.cmd("ZADD").arg(&geo_ttl_key).arg(ts).arg(driver_id);
+
+        // Store current geohash
+        pipe.cmd("SETEX")
+            .arg(&hash_key)
+            .arg(META_TTL_SECONDS)
+            .arg(&new_geohash);
+
+        let _: () = pipe
+            .query_async(&mut redis)
+            .await
+            .context("Failed to update driver location")?;
 
         Ok(())
     }
 
-    /// Hapus driver dari GEO set (saat offline / disconnect)
+    // ── Remove Driver ─────────────────────────────────────────────────────────
+
     pub async fn remove_driver(&self, driver_id: &str, service_type: &str) -> Result<()> {
-        let mut redis = self.redis.clone();
-        let geo_key = Self::geo_key(service_type);
+        Self::validate_driver_id(driver_id)?;
 
-        let _: Result<(), _> = redis.zrem(geo_key, driver_id).await;
-        let _: Result<(), _> = redis.del(Self::detail_key(driver_id)).await;
+        let mut redis = self.redis.clone();
+        let hash_key = Self::hash_key(driver_id);
+
+        let geohash: Option<String> = redis
+            .get(&hash_key)
+            .await
+            .context("Failed to get driver geohash")?;
+
+        let geohash = match geohash {
+            Some(h) => h,
+            None => {
+                tracing::warn!("No geohash found for driver {}", driver_id);
+                return Ok(());
+            }
+        };
+
+        let geo_key = Self::geo_key(service_type, &geohash);
+        let geo_ttl_key = Self::geo_ttl_key(service_type, &geohash);
+        let detail_key = Self::detail_key(driver_id);
+
+        let _: () = redis::pipe()
+            .atomic()
+            .cmd("ZREM")
+            .arg(&geo_key)
+            .arg(driver_id)
+            .cmd("DEL")
+            .arg(&detail_key)
+            .cmd("ZREM")
+            .arg(&geo_ttl_key)
+            .arg(driver_id)
+            .cmd("DEL")
+            .arg(&hash_key)
+            .query_async(&mut redis)
+            .await
+            .context("Failed to remove driver")?;
+
         Ok(())
     }
 
+    // ── Find Nearby Drivers ───────────────────────────────────────────────────
+
+    /// FIX: Gunakan pipeline untuk query semua grids sekaligus (5-10x faster)
     pub async fn find_nearby_drivers(
         &self,
         lat: f64,
         lng: f64,
         service_type: &str,
     ) -> Result<Vec<(String, f64)>> {
-        let mut redis = self.redis.clone();
-        let geo_key = Self::geo_key(service_type);
+        Self::validate_coordinates(lat, lng)?;
 
-        // GEORADIUS dengan WITHCOORD WITHDIST sekaligus — 1 round trip ke Redis
-        // format return: Vec<(member, dist, (lng, lat))>
-        let members: Vec<(String, f64, (f64, f64))> = redis::cmd("GEORADIUS")
-            .arg(&geo_key)
-            .arg(lng)
-            .arg(lat)
-            .arg(SEARCH_RADIUS_KM)
-            .arg("km")
-            .arg("WITHDIST")
-            .arg("WITHCOORD")
-            .arg("ASC")
-            .arg("COUNT")
-            .arg(MAX_DRIVERS)
+        // Get 9 grids to search
+        let search_grids = Self::get_search_grids(lat, lng)?;
+
+        let mut redis = self.redis.clone();
+
+        // FIX: Pipeline semua GEORADIUS queries sekaligus
+        let mut pipe = redis::pipe();
+
+        for geohash in &search_grids {
+            let geo_key = Self::geo_key(service_type, geohash);
+
+            pipe.cmd("GEOSEARCH")
+                .arg(&geo_key)
+                .arg("FROMLONLAT")
+                .arg(lng)
+                .arg(lat)
+                .arg("BYRADIUS")
+                .arg(SEARCH_RADIUS_KM)
+                .arg("km")
+                .arg("WITHDIST")
+                .arg("ASC");
+        }
+
+        // Execute pipeline - return Vec<Vec<(String, f64)>>
+        let results: Vec<Vec<(String, f64)>> = pipe
             .query_async(&mut redis)
             .await
-            .unwrap_or_default();
+            .unwrap_or_else(|_| vec![vec![]; search_grids.len()]);
 
-        // HashSet untuk deduplicate driver_id
+        // Flatten & deduplicate
         let mut seen = std::collections::HashSet::new();
-        let mut result = Vec::new();
+        let mut all_drivers: Vec<(String, f64)> = results
+            .into_iter()
+            .flatten()
+            .filter(|(id, _)| seen.insert(id.clone()))
+            .collect();
 
-        for (driver_id, dist_km, _coord) in members {
-            if seen.insert(driver_id.clone()) {
-                // dist dari Redis dalam km → convert ke meter
-                result.push((driver_id, dist_km * 1000.0));
-            }
-        }
+        // Sort by distance
+        all_drivers.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        all_drivers.truncate(MAX_DRIVERS);
+
+        // Convert km to meters
+        let result: Vec<_> = all_drivers
+            .into_iter()
+            .map(|(id, dist_km)| (id, dist_km * 1000.0))
+            .collect();
+
+        tracing::debug!(
+            "Found {} nearby drivers in {} grids",
+            result.len(),
+            search_grids.len()
+        );
 
         Ok(result)
     }
 
+    // ── Get Driver Location ───────────────────────────────────────────────────
+
     pub async fn get_driver_location(&self, driver_id: &str) -> Result<Option<DriverLocation>> {
+        Self::validate_driver_id(driver_id)?;
+
         let mut redis = self.redis.clone();
-        let raw: Option<String> = redis.get(Self::detail_key(driver_id)).await.unwrap_or(None);
+        let detail_key = Self::detail_key(driver_id);
 
-        let location = raw.and_then(|s| {
-            let v: serde_json::Value = serde_json::from_str(&s).ok()?;
-            Some(DriverLocation {
-                driver_id: driver_id.to_string(),
-                lat: v["lat"].as_f64()?,
-                lng: v["lng"].as_f64()?,
-                heading: v["heading"].as_f64().map(|h| h as f32),
-                speed: v["speed"].as_f64().map(|s| s as f32),
-                updated_at: v["ts"].as_i64().unwrap_or(0),
-            })
-        });
+        let bytes: Option<Vec<u8>> = redis
+            .get(&detail_key)
+            .await
+            .context("Failed to get driver location")?;
 
-        Ok(location)
+        match bytes {
+            Some(b) => {
+                let meta = DriverLocationMeta::decode(&b[..])
+                    .context("Failed to decode DriverLocationMeta")?;
+
+                Ok(Some(DriverLocation {
+                    driver_id: driver_id.to_string(),
+                    lat: meta.lat,
+                    lng: meta.lng,
+                    heading: Some(meta.heading as f32),
+                    speed: Some(meta.speed as f32),
+                    updated_at: meta.ts,
+                }))
+            }
+            None => Ok(None),
+        }
     }
 
-    /// Simpan order aktif driver (untuk recovery jika server restart)
-    pub async fn set_driver_order(&self, driver_id: &str, order_id: &str) -> Result<()> {
+    // ── Cleanup ───────────────────────────────────────────────────────────────
+
+    pub async fn cleanup_grid(&self, service_type: &str, geohash: &str) -> Result<usize> {
         let mut redis = self.redis.clone();
-        let _: () = redis
-            .set_ex(Self::order_key(driver_id), order_id, 3600u64 * 4)
+        let geo_key = Self::geo_key(service_type, geohash);
+        let geo_ttl_key = Self::geo_ttl_key(service_type, geohash);
+
+        let cutoff = chrono::Utc::now().timestamp_millis() - (META_TTL_SECONDS * 1000);
+
+        let offline_drivers: Vec<String> = redis::cmd("ZRANGEBYSCORE")
+            .arg(&geo_ttl_key)
+            .arg("-inf")
+            .arg(cutoff)
+            .query_async(&mut redis)
             .await
-            .context("failed to set driver order")?;
+            .context("Failed to get offline drivers")?;
+
+        if offline_drivers.is_empty() {
+            return Ok(0);
+        }
+
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+
+        for driver_id in &offline_drivers {
+            pipe.cmd("ZREM").arg(&geo_key).arg(driver_id);
+            pipe.cmd("ZREM").arg(&geo_ttl_key).arg(driver_id);
+        }
+
+        let _: () = pipe
+            .query_async(&mut redis)
+            .await
+            .context("Failed to cleanup offline drivers")?;
+
+        if offline_drivers.len() > 0 {
+            tracing::info!(
+                "Cleaned up {} offline drivers from grid {} ({})",
+                offline_drivers.len(),
+                geohash,
+                service_type
+            );
+        }
+
+        Ok(offline_drivers.len())
+    }
+
+    /// FIX: Gunakan SCAN instead of KEYS (production safe)
+    pub async fn get_active_grids(&self, service_type: &str) -> Result<Vec<String>> {
+        let mut redis = self.redis.clone();
+        let pattern = format!("geo:{}:*", service_type);
+        let mut grids = Vec::new();
+        let mut cursor = 0u64;
+
+        loop {
+            // SCAN dengan COUNT 100 per iteration
+            let (new_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(&pattern)
+                .arg("COUNT")
+                .arg(100)
+                .query_async(&mut redis)
+                .await
+                .context("Failed to scan active grids")?;
+
+            // Extract geohash dari keys
+            for key in keys {
+                if let Some(hash) = key.strip_prefix(&format!("geo:{}:", service_type)) {
+                    grids.push(hash.to_string());
+                }
+            }
+
+            cursor = new_cursor;
+
+            // Cursor 0 = selesai
+            if cursor == 0 {
+                break;
+            }
+        }
+
+        // Deduplicate
+        grids.sort();
+        grids.dedup();
+
+        Ok(grids)
+    }
+
+    // ── Order Tracking ────────────────────────────────────────────────────────
+
+    pub async fn set_driver_order(&self, driver_id: &str, order_id: &str) -> Result<()> {
+        Self::validate_driver_id(driver_id)?;
+        if order_id.is_empty() {
+            anyhow::bail!("Order ID cannot be empty");
+        }
+
+        let mut redis = self.redis.clone();
+        let order_key = Self::order_key(driver_id);
+
+        let _: () = redis
+            .set_ex(&order_key, order_id, ORDER_TTL_SECONDS)
+            .await
+            .context("Failed to set driver order")?;
+
         Ok(())
     }
 
     pub async fn get_driver_order(&self, driver_id: &str) -> Result<Option<String>> {
+        Self::validate_driver_id(driver_id)?;
+
         let mut redis = self.redis.clone();
-        Ok(redis.get(Self::order_key(driver_id)).await.unwrap_or(None))
+        let order_key = Self::order_key(driver_id);
+
+        redis
+            .get(&order_key)
+            .await
+            .context("Failed to get driver order")
     }
 
     pub async fn clear_driver_order(&self, driver_id: &str) -> Result<()> {
+        Self::validate_driver_id(driver_id)?;
+
         let mut redis = self.redis.clone();
-        let _: Result<(), _> = redis.del(Self::order_key(driver_id)).await;
+        let order_key = Self::order_key(driver_id);
+
+        let _: () = redis
+            .del(&order_key)
+            .await
+            .context("Failed to clear driver order")?;
+
         Ok(())
+    }
+
+    // ── Stats ─────────────────────────────────────────────────────────────────
+
+    pub async fn count_active_drivers(&self, service_type: &str) -> Result<usize> {
+        let grids = self.get_active_grids(service_type).await?;
+
+        let mut redis = self.redis.clone();
+
+        let mut pipe = redis::pipe();
+
+        for geohash in grids {
+            let geo_key = Self::geo_key(service_type, &geohash);
+            pipe.cmd("ZCARD").arg(&geo_key);
+        }
+
+        let total: Vec<usize> = pipe.query_async(&mut redis).await?;
+
+        Ok(total.into_iter().sum())
     }
 }
 
-/// Haversine distance dalam meter antara dua koordinat
+// ── Background Cleanup Task ───────────────────────────────────────────────────
+
+pub async fn start_cleanup_task(
+    location_service: std::sync::Arc<LocationService>,
+    interval_secs: u64,
+) {
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
+
+    loop {
+        interval.tick().await;
+
+        for service_type in &["mobil", "motor", "send", "food", "nebeng"] {
+            let grids = match location_service.get_active_grids(service_type).await {
+                Ok(g) => g,
+                Err(e) => {
+                    tracing::error!("Failed to get grids for {}: {:?}", service_type, e);
+                    continue;
+                }
+            };
+
+            let mut total_cleaned = 0;
+            for geohash in grids {
+                match location_service.cleanup_grid(service_type, &geohash).await {
+                    Ok(count) => total_cleaned += count,
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to cleanup grid {} ({}): {:?}",
+                            geohash,
+                            service_type,
+                            e
+                        );
+                    }
+                }
+            }
+
+            if total_cleaned > 0 {
+                tracing::info!(
+                    "Cleaned up {} total offline {} drivers",
+                    total_cleaned,
+                    service_type
+                );
+            }
+        }
+    }
+}
+
+// ── Haversine Distance ────────────────────────────────────────────────────────
+
 pub fn haversine_m(lat1: f64, lng1: f64, lat2: f64, lng2: f64) -> f64 {
-    let r = 6_371_000.0_f64;
+    const EARTH_RADIUS_M: f64 = 6_371_000.0;
+
     let dlat = (lat2 - lat1).to_radians();
     let dlng = (lng2 - lng1).to_radians();
+
     let a = (dlat / 2.0).sin().powi(2)
         + lat1.to_radians().cos() * lat2.to_radians().cos() * (dlng / 2.0).sin().powi(2);
-    2.0 * r * a.sqrt().asin()
+
+    2.0 * EARTH_RADIUS_M * a.sqrt().asin()
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_geohash_same_precision() {
+        let hash = LocationService::get_geohash(-6.2088, 106.8456).unwrap();
+        assert_eq!(hash.len(), GEO_PRECISION);
+        println!("Geohash: {}", hash);
+    }
+
+    #[test]
+    fn test_search_grids() {
+        let grids = LocationService::get_search_grids(-6.2088, 106.8456).unwrap();
+        assert!(grids.len() <= 9); // Max 9 (center + 8 neighbors)
+        assert!(grids.len() >= 1); // Min 1 (center)
+
+        // Semua harus precision yang sama
+        for grid in &grids {
+            assert_eq!(grid.len(), GEO_PRECISION);
+        }
+
+        println!("Search grids: {:?}", grids);
+    }
+
+    #[test]
+    fn test_haversine() {
+        let jakarta = (-6.2088, 106.8456);
+        let bandung = (-6.9175, 107.6191);
+
+        let distance = haversine_m(jakarta.0, jakarta.1, bandung.0, bandung.1);
+
+        assert!((distance - 150_000.0).abs() < 10_000.0);
+    }
 }

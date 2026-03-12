@@ -364,8 +364,8 @@ async fn dispatch<OR, UR, NR, RR>(
                     user_id,
                     loc.lat,
                     loc.lng,
-                    (loc.heading != 0.0).then_some(loc.heading as f64),
-                    (loc.speed != 0.0).then_some(loc.speed as f64),
+                    (loc.heading != 0.0).then_some(loc.heading as f32),
+                    (loc.speed != 0.0).then_some(loc.speed as f32),
                     &vehicle_type,
                 )
                 .await;
