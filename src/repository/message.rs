@@ -147,15 +147,11 @@ impl MessageRepository {
         let q = format!(
             r"SELECT {} FROM messages m JOIN users u ON m.sender_id = u.id JOIN orders o ON m.order_id = o.id
                   WHERE (m.sender_id = ? AND m.recipient_id = ?) OR (m.sender_id = ? AND m.recipient_id = ?)
-                  ORDER BY m.sent_at DESC LIMIT ?",
+                  ORDER BY m.sent_at DESC",
             Self::msg_cols()
         );
-        let rows: Vec<Row> = exec_rows(
-            &self.pool,
-            &q,
-            (sender_id, reader_id, reader_id, sender_id, limit),
-        )
-        .await?;
+        let rows: Vec<Row> =
+            exec_rows(&self.pool, &q, (sender_id, reader_id, reader_id, sender_id)).await?;
 
         let mut msgs: Vec<Message> = rows
             .into_iter()

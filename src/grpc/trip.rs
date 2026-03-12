@@ -221,8 +221,7 @@ where
             }
         });
 
-        // ── 4. Output stream server→client ───────────────────────────────────
-        let out = tokio_stream::wrappers::UnboundedReceiverStream::new(event_rx);
+        let out = tokio_stream::wrappers::ReceiverStream::new(event_rx);
         Ok(Response::new(Box::pin(out)))
     }
 }
