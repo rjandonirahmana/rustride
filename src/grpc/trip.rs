@@ -1,3 +1,5 @@
+use anyhow::{anyhow, Result};
+use mysql_async::Connection;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio_stream::StreamExt;
@@ -7,10 +9,12 @@ use crate::{
     auth::JwtService,
     connections::ConnectionManager,
     location::LocationService,
+    models::order::Order as ordermodels,
     proto::ridehailing::{
         app_service_server::AppService, client_event::Payload as Cp, server_event::Payload as Sp,
-        ClientEvent, ConnectedEvent, DriverInfo, ErrorEvent, HistoryEvent, NearbyOrderItem,
-        NearbyOrdersEvent, NearbyRideshareEvent, NewMessageEvent, OrderCreatedEvent,
+        CallEndedEvent, ClientEvent, ConnectedEvent, CurrentOrder, DriverInfo, ErrorEvent,
+        HistoryEvent, IceCandidateEvent, IncomingCallAnswer, IncomingCallOffer, NearbyOrderItem,
+        NearbyOrdersEvent, NearbyRideshareEvent, NewMessageEvent, Order, OrderCreatedEvent,
         OrderStatusEvent, PongEvent, PresenceEvent, RideshareJoinedEvent, RideshareOpenedEvent,
         ServerEvent,
     },
@@ -84,6 +88,7 @@ where
 
         let user_id = claims.sub.clone();
         let role = claims.role.clone();
+        let vehicle_type = claims.vehicle_type.clone();
 
         // ── 2. Register channel server→client ─────────────────────────────────
         let event_rx = self.connections.connect(&user_id).await;
@@ -95,7 +100,7 @@ where
             self.connections.register_rider(&user_id).await;
         }
 
-        tracing::info!("userid {} connect {}", &user_id, &role);
+        tracing::info!("userid {} connect {} {}", &user_id, &role, &vehicle_type);
 
         self.connections.send(
             &user_id,
@@ -108,55 +113,167 @@ where
             },
         );
         let uid = user_id.clone();
-
         if role == "rider" {
-            // ── 2b. Auto-push active order saat connect / reconnect ──────────────────
-
             let order_svc2 = self.order_svc.clone();
             let connections2 = self.connections.clone();
             let user_repo2 = self.user_repo.clone();
             let uid2 = user_id.clone();
 
             tokio::spawn(async move {
-                let order = match order_svc2.get_active_order_for_user(&uid2).await {
-                    Ok(Some(o)) => o,
+                tracing::info!("🔵 Rider reconnect flow started for: {}", uid2);
+
+                // Add timeout untuk prevent hanging
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    order_svc2.get_active_order_for_user(&uid2),
+                )
+                .await
+                {
+                    Ok(Ok(Some(o))) => {
+                        tracing::info!(
+                            order_id = %o.id,
+                            status = %o.status,
+                            "📦 Found active order"
+                        );
+
+                        // ✅ IMPROVED: Load driver info with proper error handling
+                        let driver_info = if let Some(ref driver_id) = o.driver_id {
+                            tracing::info!(driver_id = %driver_id, "🔍 Fetching driver info...");
+
+                            match user_repo2.find_driver_by_id(driver_id).await {
+                                Ok(Some((user, profile))) => {
+                                    tracing::info!(
+                                        driver_id = %driver_id,
+                                        driver_name = %user.name,
+                                        vehicle_plate = %profile.vehicle_plate,
+                                        "✅ Driver info loaded successfully"
+                                    );
+                                    Some(DriverInfo {
+                                        user_id: driver_id.clone(),
+                                        name: user.name,
+                                        phone: user.phone,
+                                        vehicle_plate: profile.vehicle_plate,
+                                        vehicle_model: profile.vehicle_model,
+                                        vehicle_color: profile.vehicle_color,
+                                        rating: profile.rating,
+                                    })
+                                }
+                                Ok(None) => {
+                                    tracing::warn!(
+                                        driver_id = %driver_id,
+                                        "❌ Driver not found in database - data consistency issue"
+                                    );
+                                    None
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        driver_id = %driver_id,
+                                        error = %e,
+                                        "❌ Failed to load driver info from DB"
+                                    );
+                                    None
+                                }
+                            }
+                        } else {
+                            tracing::debug!(
+                                order_id = %o.id,
+                                "⏳ No driver assigned yet (order still searching)"
+                            );
+                            None
+                        };
+
+                        // Send order status to rider
+                        connections2.send(
+                            &uid2,
+                            ServerEvent {
+                                payload: Some(Sp::OrderStatus(OrderStatusEvent {
+                                    order_id: o.id,
+                                    status: o.status,
+                                    driver: driver_info,
+                                    fare_estimate: o.fare_estimate,
+                                    service_type: o.service_type,
+                                })),
+                            },
+                        );
+                    }
+                    Ok(Ok(None)) => {
+                        tracing::info!(
+                            rider_id = %uid2,
+                            "📭 No active order (rider waiting for first order)"
+                        );
+                        // No active order - this is normal
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            rider_id = %uid2,
+                            error = %e,
+                            "💥 Failed to fetch active order"
+                        );
+                        connections2.send(
+                            &uid2,
+                            ServerEvent {
+                                payload: Some(Sp::Error(ErrorEvent {
+                                    code: "ORDER_FETCH_FAILED".to_string(),
+                                    message: format!("Could not load active order: {}", e),
+                                })),
+                            },
+                        );
+                    }
+                    Err(_) => {
+                        tracing::error!(
+                            rider_id = %uid2,
+                            "⏱️ Timeout fetching active order (took >10s)"
+                        );
+                        connections2.send(
+                            &uid2,
+                            ServerEvent {
+                                payload: Some(Sp::Error(ErrorEvent {
+                                    code: "ORDER_TIMEOUT".to_string(),
+                                    message: "Order fetch timeout - please reconnect".to_string(),
+                                })),
+                            },
+                        );
+                    }
+                }
+            });
+        } else {
+            let order_svc = self.order_svc.clone();
+            let connections2 = self.connections.clone();
+            let uid2 = user_id.clone();
+
+            tokio::spawn(async move {
+                let _ = match order_svc.get_active_order_for_driver(&uid2).await {
+                    Ok(Some(o)) => {
+                        connections2.send(
+                            &uid2,
+                            ServerEvent {
+                                payload: Some(Sp::CurrentOrder(CurrentOrder {
+                                    order: Some(Order {
+                                        id: o.id,
+                                        rider_id: o.rider_id,
+                                        driver_id: uid2.to_string(),
+                                        status: o.status,
+                                        pickup_address: o.pickup_address,
+                                        pickup_lat: o.pickup_lat,
+                                        pickup_lng: o.pickup_lng,
+                                        dest_address: o.dest_address,
+                                        dest_lat: o.dest_lat,
+                                        dest_lng: o.dest_lng,
+                                        fare_estimate: o.fare_estimate,
+                                        service_type: o.service_type,
+                                        created_at: o.created_at,
+                                        rider_name: o.rider_name,
+                                    }),
+                                })),
+                            },
+                        );
+                    }
                     Ok(None) => return, // tidak ada order aktif, skip
                     Err(e) => {
                         tracing::warn!(user_id = %uid2, "Gagal fetch active order on connect: {}", e);
                         return;
                     }
                 };
-
-                // Ambil info driver kalau order sudah di-assign
-                let driver_info = if let Some(ref driver_id) = order.driver_id {
-                    match user_repo2.find_driver_by_id(driver_id).await {
-                        Ok(Some((user, profile))) => Some(DriverInfo {
-                            user_id: driver_id.clone(),
-                            name: user.name,
-                            phone: user.phone,
-                            vehicle_plate: profile.vehicle_plate,
-                            vehicle_model: profile.vehicle_model,
-                            vehicle_color: profile.vehicle_color,
-                            rating: profile.rating,
-                        }),
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
-
-                connections2.send(
-                    &uid2,
-                    ServerEvent {
-                        payload: Some(Sp::OrderStatus(OrderStatusEvent {
-                            order_id: order.id,
-                            status: order.status,
-                            driver: driver_info,
-                            fare_estimate: order.fare_estimate,
-                            service_type: order.service_type,
-                        })),
-                    },
-                );
             });
         }
 
@@ -182,6 +299,7 @@ where
                             &uid,
                             &role_r,
                             &name,
+                            &vehicle_type,
                             &order_svc,
                             &connections,
                             &location,
@@ -228,11 +346,12 @@ where
 
 // ── Event dispatcher ──────────────────────────────────────────────────────────
 
-async fn dispatch<OR, UR, NR, RR>(
+async fn dispatch<OR, UR, RR, NR>(
     event: ClientEvent,
     user_id: &str,
     role: &str,
     username: &str,
+    vehicle_type: &str,
     order_svc: &Arc<OrderService<OR, UR>>,
     connections: &Arc<ConnectionManager>,
     location: &LocationService,
@@ -350,15 +469,6 @@ async fn dispatch<OR, UR, NR, RR>(
                 return;
             }
 
-            let vehicle_type = order_svc
-                .user_repo
-                .find_driver_by_id(user_id)
-                .await
-                .ok()
-                .flatten()
-                .map(|(_, p)| p.vehicle_type)
-                .unwrap_or_else(|| "motor".to_string()); // ← fallback "motor"
-
             let err = location
                 .update_driver_location(
                     user_id,
@@ -378,24 +488,21 @@ async fn dispatch<OR, UR, NR, RR>(
 
             // Ada order aktif → broadcast ke rider yang punya order
             // Tidak ada order → push ke SEMUA rider yang online (real-time map)
-            match location.get_driver_order(user_id).await {
-                Ok(Some(order_id)) => {
-                    if let Ok(Some(order)) = order_svc.get_active_order_for_driver(&order_id).await
-                    {
-                        connections.send(
-                            &order.rider_id,
-                            ServerEvent {
-                                payload: Some(Sp::DriverLoc(
-                                    crate::proto::ridehailing::DriverLocationEvent {
-                                        lat: loc.lat,
-                                        lng: loc.lng,
-                                        heading: loc.heading,
-                                        order_id: order.id,
-                                    },
-                                )),
-                            },
-                        );
-                    }
+            match order_svc.get_active_order_for_driver(&user_id).await {
+                Ok(Some(order)) => {
+                    connections.send(
+                        &order.rider_id,
+                        ServerEvent {
+                            payload: Some(Sp::DriverLoc(
+                                crate::proto::ridehailing::DriverLocationEvent {
+                                    lat: loc.lat,
+                                    lng: loc.lng,
+                                    heading: loc.heading,
+                                    order_id: order.id,
+                                },
+                            )),
+                        },
+                    );
                 }
                 Err(r) => {
                     eprintln!("=== failed to update location error: {}", r);
@@ -403,7 +510,7 @@ async fn dispatch<OR, UR, NR, RR>(
                     return;
                 }
                 Ok(None) => {}
-            };
+            }
         }
 
         // ── Driver: browse order tersedia ─────────────────────────────────────
@@ -413,45 +520,69 @@ async fn dispatch<OR, UR, NR, RR>(
                 return;
             }
 
-            // Fix: simpan result sekali, tidak query Redis 2x
-            if let Ok(Some(active_order_id)) = location.get_driver_order(user_id).await {
-                connections.send(
-                    user_id,
-                    err_event(
-                        "BUSY",
-                        &format!("Selesaikan order {} dulu", active_order_id),
-                    ),
-                );
-                return;
-            }
-
-            let radius = (b.radius_km != 0.0).then_some(b.radius_km);
-            match order_svc
-                .get_nearby_orders(b.lat, b.lng, &b.service_type, radius)
-                .await
-            {
-                Ok(orders) => {
-                    let total = orders.len() as u32;
-                    let items = orders
-                        .iter()
-                        .map(|no| NearbyOrderItem {
-                            order: Some(order_to_proto(&no.order)),
-                            distance_to_pickup_m: no.distance_to_pickup_m,
-                            eta_to_pickup_min: no.eta_to_pickup_min,
-                        })
-                        .collect();
+            match order_svc.get_active_order_for_driver(&user_id).await {
+                Ok(Some(o)) => {
                     connections.send(
                         user_id,
                         ServerEvent {
-                            payload: Some(Sp::NearbyOrders(NearbyOrdersEvent {
-                                orders: items,
-                                total,
+                            payload: Some(Sp::CurrentOrder(CurrentOrder {
+                                order: Some(Order {
+                                    id: o.id,
+                                    rider_id: o.rider_id,
+                                    driver_id: user_id.to_string(),
+                                    status: o.status,
+                                    pickup_address: o.pickup_address,
+                                    pickup_lat: o.pickup_lat,
+                                    pickup_lng: o.pickup_lng,
+                                    dest_address: o.dest_address,
+                                    dest_lat: o.dest_lat,
+                                    dest_lng: o.dest_lng,
+                                    fare_estimate: o.fare_estimate,
+                                    service_type: o.service_type,
+                                    created_at: o.created_at,
+                                    rider_name: o.rider_name,
+                                }),
                             })),
                         },
                     );
+                    return;
                 }
-                Err(e) => connections.send(user_id, err_event("BROWSE_FAILED", &e.to_string())),
-            }
+                Ok(None) => {
+                    let radius = (b.radius_km != 0.0).then_some(b.radius_km);
+                    match order_svc
+                        .get_nearby_orders(b.lat, b.lng, &b.service_type, radius)
+                        .await
+                    {
+                        Ok(orders) => {
+                            let total = orders.len() as u32;
+                            let items = orders
+                                .iter()
+                                .map(|no| NearbyOrderItem {
+                                    order: Some(order_to_proto(&no.order)),
+                                    distance_to_pickup_m: no.distance_to_pickup_m,
+                                    eta_to_pickup_min: no.eta_to_pickup_min,
+                                })
+                                .collect();
+                            connections.send(
+                                user_id,
+                                ServerEvent {
+                                    payload: Some(Sp::NearbyOrders(NearbyOrdersEvent {
+                                        orders: items,
+                                        total,
+                                    })),
+                                },
+                            );
+                        }
+                        Err(e) => {
+                            connections.send(user_id, err_event("BROWSE_FAILED", &e.to_string()))
+                        }
+                    }
+                }
+                Err(e) => {
+                    connections.send(user_id, err_event("BROWSE_FAILED", &e.to_string()));
+                    return;
+                }
+            };
         }
 
         // ── Driver: accept order ──────────────────────────────────────────────
@@ -528,57 +659,80 @@ async fn dispatch<OR, UR, NR, RR>(
             if m.content.trim().is_empty() {
                 connections.send(
                     user_id,
-                    err_event("EMPTY_CONTENT", "Content tidak boleh kosong"),
+                    err_event("EMPTY_CONTENT", "Pesan tidak boleh kosong"),
                 );
                 return;
             }
 
+            // 2. Load order
             let order = match order_svc.order_repo.find_by_id(&m.order_id).await {
-                Ok(Some(o)) => o, // Menghasilkan Order
+                Ok(Some(o)) => o,
                 Ok(None) => {
-                    connections.send(user_id, err_event("ACTIVE_ORDER_FAILED", "order not found"));
-                    return; // Keluar dari fungsi, jadi match tidak perlu mengembalikan nilai
+                    connections.send(
+                        user_id,
+                        err_event("ORDER_NOT_FOUND", "Order tidak ditemukan"),
+                    );
+                    return;
                 }
                 Err(e) => {
-                    connections.send(user_id, err_event("ACTIVE_ORDER_FAILED", &e.to_string()));
-                    return; // Keluar dari fungsi
+                    connections.send(user_id, err_event("DB_ERROR", &e.to_string()));
+                    return;
                 }
             };
 
-            // ── Cek order aktif antara rider & driver ──────────────────────────
-            let allowed = match role {
-                "rider" => {
-                    // Rider harus punya order aktif dengan driver tersebut
-                    order.rider_id == user_id
+            // 3. ✅ Get correct peer ID based on role
+            let peer_id = match get_peer_id(role, &order, user_id) {
+                Ok(p) => p,
+                Err(e) => {
+                    connections.send(user_id, err_event("INVALID_ORDER", &e.to_string()));
+                    return;
                 }
-                "driver" => {
-                    // Driver harus punya order aktif dengan rider tersebut
-                    if let Some(driver) = order.driver_id {
-                        driver == user_id
-                    } else {
-                        false
-                    }
-                }
-                _ => false,
             };
 
-            if !allowed {
+            // 4. ✅ Verify recipient_id matches the peer
+            if m.recipient_id != peer_id {
+                tracing::warn!(
+                    user_id = %user_id,
+                    recipient = %m.recipient_id,
+                    expected = %peer_id,
+                    "Recipient mismatch - potential security issue"
+                );
+                connections.send(
+                    user_id,
+                    err_event("INVALID_RECIPIENT", "Tidak bisa chat dengan person ini"),
+                );
+                return;
+            }
+
+            // 5. ✅ Check order is in active state
+            if !is_order_active(&order.status) {
                 connections.send(
                     user_id,
                     err_event(
-                        "NO_ACTIVE_ORDER",
-                        "Chat hanya tersedia saat order berlangsung",
+                        "INACTIVE_ORDER",
+                        "Chat hanya tersedia saat order berlangsung (accepted, arrived, on_trip)",
                     ),
                 );
                 return;
             }
-            // ──────────────────────────────────────────────────────────────────
 
+            // 6. ✅ Check if recipient is connected (optional but recommended)
+            if !connections.is_connected(&peer_id).await {
+                tracing::info!(
+                    sender = %user_id,
+                    recipient = %peer_id,
+                    "Recipient offline - message will be queued"
+                );
+                // Still send message to DB for offline delivery
+                // Or notify sender: connections.send(user_id, err_event("OFFLINE", "Penerima sedang offline"));
+            }
+
+            // 7. Send message
             if let Err(e) = chat_svc
-                .send_text(user_id, &m.recipient_id, &m.content, username, &order.id)
+                .send_text(user_id, &peer_id, &m.content, username, &order.id)
                 .await
             {
-                tracing::error!(error = %e, "send_text failed {:?}", e);
+                tracing::error!(error = %e, "send_text failed");
                 connections.send(user_id, err_event("SEND_FAILED", &e.to_string()));
             }
         }
@@ -593,50 +747,63 @@ async fn dispatch<OR, UR, NR, RR>(
                 return;
             }
 
+            // 2. Load order
             let order = match order_svc.order_repo.find_by_id(&m.order_id).await {
-                Ok(Some(o)) => o, // Menghasilkan Order
+                Ok(Some(o)) => o,
                 Ok(None) => {
-                    connections.send(user_id, err_event("ACTIVE_ORDER_FAILED", "order not found"));
-                    return; // Keluar dari fungsi, jadi match tidak perlu mengembalikan nilai
+                    connections.send(
+                        user_id,
+                        err_event("ORDER_NOT_FOUND", "Order tidak ditemukan"),
+                    );
+                    return;
                 }
                 Err(e) => {
-                    connections.send(user_id, err_event("ACTIVE_ORDER_FAILED", &e.to_string()));
-                    return; // Keluar dari fungsi
+                    connections.send(user_id, err_event("DB_ERROR", &e.to_string()));
+                    return;
                 }
             };
 
-            // ── Cek order aktif antara rider & driver ──────────────────────────
-            let allowed = match role {
-                "rider" => {
-                    // Rider harus punya order aktif dengan driver tersebut
-                    order.rider_id == user_id
+            // 3. ✅ Get correct peer ID based on role
+            let peer_id = match get_peer_id(role, &order, user_id) {
+                Ok(p) => p,
+                Err(e) => {
+                    connections.send(user_id, err_event("INVALID_ORDER", &e.to_string()));
+                    return;
                 }
-                "driver" => {
-                    // Driver harus punya order aktif dengan rider tersebut
-                    if let Some(driver) = order.driver_id {
-                        driver == user_id
-                    } else {
-                        false
-                    }
-                }
-                _ => false,
             };
 
-            if !allowed {
+            // 4. ✅ Verify recipient_id matches the peer
+            if m.recipient_id != peer_id {
+                tracing::warn!(
+                    user_id = %user_id,
+                    recipient = %m.recipient_id,
+                    expected = %peer_id,
+                    "Recipient mismatch in SendMedia"
+                );
+                connections.send(
+                    user_id,
+                    err_event("INVALID_RECIPIENT", "Tidak bisa chat dengan person ini"),
+                );
+                return;
+            }
+
+            // 5. ✅ Check order is in active state (THIS WAS MISSING!)
+            if !is_order_active(&order.status) {
                 connections.send(
                     user_id,
                     err_event(
-                        "NO_ACTIVE_ORDER",
+                        "INACTIVE_ORDER",
                         "Chat hanya tersedia saat order berlangsung",
                     ),
                 );
                 return;
             }
 
+            // 6. Send media
             if let Err(e) = chat_svc
                 .send_media(
                     user_id,
-                    &m.recipient_id,
+                    &peer_id,
                     &m.caption,
                     &m.media_url,
                     &m.media_mime,
@@ -1036,5 +1203,142 @@ async fn dispatch<OR, UR, NR, RR>(
                 tracing::error!(error = %e, "mark_all_notif_read failed");
             }
         }
+        Cp::CallOffer(c) => {
+            let order = match order_svc.order_repo.find_by_id(&c.order_id).await {
+                Ok(Some(o)) => o,
+                Ok(None) => {
+                    connections.send(
+                        user_id,
+                        err_event("ORDER_NOT_FOUND", "Order tidak ditemukan"),
+                    );
+                    return;
+                }
+                Err(e) => {
+                    connections.send(user_id, err_event("DB_ERROR", &e.to_string()));
+                    return;
+                }
+            };
+
+            // 2. ✅ Get correct peer ID based on role
+            let peer_id = match get_peer_id(role, &order, user_id) {
+                Ok(p) => p,
+                Err(e) => {
+                    connections.send(user_id, err_event("INVALID_ORDER", &e.to_string()));
+                    return;
+                }
+            };
+
+            // 3. ✅ Verify target_user_id matches the peer (THIS WAS MISSING!)
+            if c.target_user_id != peer_id {
+                tracing::warn!(
+                    caller = %user_id,
+                    target = %c.target_user_id,
+                    expected = %peer_id,
+                    "Call target mismatch - potential security issue"
+                );
+                connections.send(
+                    user_id,
+                    err_event("INVALID_TARGET", "Tidak bisa call person ini"),
+                );
+                return;
+            }
+
+            // 4. ✅ Check order is in active state (THIS WAS MISSING!)
+            if !is_order_active(&order.status) {
+                connections.send(
+                    user_id,
+                    err_event(
+                        "INACTIVE_ORDER",
+                        "Call hanya tersedia saat order berlangsung",
+                    ),
+                );
+                return;
+            }
+
+            // 5. Log the call
+            tracing::info!(
+                caller = %user_id,
+                callee = %peer_id,
+                order_id = %c.order_id,
+                "Call offer initiated"
+            );
+
+            // 6. Send call offer to peer
+            connections.send(
+                &peer_id,
+                ServerEvent {
+                    payload: Some(Sp::IncomingCallOffer(IncomingCallOffer {
+                        caller_id: user_id.to_string(),
+                        sdp: c.sdp,
+                    })),
+                },
+            );
+        }
+        Cp::CallAnswer(a) => {
+            connections.send(
+                &a.caller_id,
+                ServerEvent {
+                    payload: Some(Sp::IncomingCallAnswer(IncomingCallAnswer {
+                        callee_id: user_id.to_string(),
+                        sdp: a.sdp,
+                    })),
+                },
+            );
+        }
+
+        Cp::IceCandidate(i) => {
+            connections.send(
+                &i.peer_id,
+                ServerEvent {
+                    payload: Some(Sp::IceCandidateEvent(IceCandidateEvent {
+                        peer_id: user_id.to_string(),
+                        candidate: i.candidate,
+                    })),
+                },
+            );
+        }
+
+        Cp::EndCall(e) => {
+            connections.send(
+                &e.peer_id,
+                ServerEvent {
+                    payload: Some(Sp::CallEnded(CallEndedEvent {
+                        peer_id: user_id.to_string(),
+                    })),
+                },
+            );
+        }
     }
+}
+
+fn get_peer_id(role: &str, order: &ordermodels, user_id: &str) -> Result<String> {
+    match role {
+        "driver" => {
+            if order.driver_id != Some(user_id.to_string()) {
+                return Err(anyhow!("Not the rider of this order"));
+            }
+            if order.driver_id.as_deref() == Some(user_id) {
+                Ok(order.rider_id.clone())
+            } else {
+                Err(anyhow!("Not the assigned driver for this order"))
+            }
+        }
+
+        "rider" => {
+            if order.rider_id != user_id {
+                return Err(anyhow!("Not the rider of this order"));
+            }
+
+            match order.driver_id.clone() {
+                Some(d) => Ok(d),
+                None => Err(anyhow!("Not the assigned driver for this order")),
+            }
+        }
+
+        _ => Err(anyhow!("Invalid role")),
+    }
+}
+
+fn is_order_active(status: &str) -> bool {
+    !matches!(status, "completed" | "cancelled" | "searching")
 }

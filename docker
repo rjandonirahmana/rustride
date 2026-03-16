@@ -1,0 +1,14 @@
+# Stage 1: Build (Gunakan image Rust resmi)
+FROM rust:1.80-slim as builder
+WORKDIR /app
+COPY . .
+# Build aplikasi dalam mode release
+RUN cargo build --release
+
+# Stage 2: Runtime (Gunakan OS minimal seperti Debian slim atau Alpine)
+FROM debian:bookworm-slim
+WORKDIR /usr/local/bin
+# Copy binary hasil build dari stage sebelumnya
+COPY --from=builder /app/target/release/rustride .
+# Jalankan aplikasi
+CMD ["./rustride"]

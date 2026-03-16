@@ -83,6 +83,10 @@ message ClientEvent {
     MarkNotifReadReq    mark_notif_read     = 29; // tandai notif sudah dibaca
     MarkAllNotifReadReq mark_all_notif_read = 30;
     MessageReq          get_message_req     = 31;
+    CallOffer           call_offer          = 32;
+    CallAnswer          call_answer         = 33;
+    IceCandidate        ice_candidate       = 34;
+    EndCallReq          end_call            = 35;
   }
 }
 
@@ -120,10 +124,24 @@ message ServerEvent {
     RideshareOpenedEvent  rideshare_opened  = 22; // konfirmasi driver buka trip
 
     // ── notifications ──
-    NotificationsEvent   notifications      = 23; // list notif
-    NewNotificationEvent new_notification   = 24; // push notif baru (realtime)
-    ConversationItems    conversation_items = 25;
+    NotificationsEvent   notifications        = 23; // list notif
+    NewNotificationEvent new_notification     = 24; // push notif baru (realtime)
+    ConversationItems    conversation_items   = 25;
+    IncomingCallOffer    incoming_call_offer  = 26;
+    IncomingCallAnswer   incoming_call_answer = 27;
+    IceCandidateEvent    ice_candidate_event  = 28;
+    CallEndedEvent       call_ended           = 29;
+    CurrentOrder         current_order        = 30;
+
   }
+}
+
+message ActivityUser {
+  repeated Order orders = 1;
+}
+
+message GetActivityUser {
+  repeated Order orders = 1;
 }
 
 message ConversationItem {
@@ -231,6 +249,10 @@ message NewOrderOffer {
   uint32 timeout_secs         = 4;
 }
 
+message CurrentOrder {
+  Order order = 1;
+}
+
 message OrderStatusEvent    { string order_id = 1; string status = 2; DriverInfo driver = 3;  string service_type = 4; // tambah
   int32 fare_estimate = 5; }
 
@@ -250,6 +272,7 @@ message OrderStatusEvent    { string order_id = 1; string status = 2; DriverInfo
     int32  fare_estimate  = 11;
     string service_type   = 12;
     string created_at     = 13;
+    string rider_name     = 14;
   }
 
   message DriverInfo {
@@ -517,4 +540,49 @@ message OrderStatusEvent    { string order_id = 1; string status = 2; DriverInfo
 
   // timestamp dalam millisecond
     int64 ts = 5;
+  }
+
+  // caller → server
+  message CallOffer {
+    string target_user_id = 1;
+    string sdp            = 2;
+    string order_id       = 3;
+  }
+
+// callee menerima dari server
+  message IncomingCallOffer {
+    string caller_id = 1;
+    string sdp       = 2;
+  }
+
+// callee → server
+  message CallAnswer {
+    string caller_id = 1;
+    string sdp       = 2;
+  }
+
+// caller menerima dari server
+  message IncomingCallAnswer {
+    string callee_id = 1;
+    string sdp       = 2;
+  }
+
+// client → server
+  message IceCandidate {
+    string peer_id   = 1;
+    string candidate = 2;
+  }
+
+// server → peer
+  message IceCandidateEvent {
+    string peer_id   = 1;
+    string candidate = 2;
+  }
+
+  message EndCallReq {
+    string peer_id = 1;
+  }
+
+  message CallEndedEvent {
+    string peer_id = 1;
   }

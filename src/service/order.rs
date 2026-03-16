@@ -46,6 +46,7 @@ pub fn order_to_proto(o: &Order) -> crate::proto::ridehailing::Order {
         fare_estimate: o.fare_estimate,
         service_type: o.service_type.clone(),
         created_at: o.created_at.clone(),
+        rider_name: o.rider_name.clone(),
     }
 }
 
@@ -61,7 +62,7 @@ fn status_event(
             status: status.to_string(),
             driver: None,
             service_type: service_tye.to_string(),
-            fare_estimate: fare_estimate.to_be(),
+            fare_estimate: *fare_estimate,
         })),
     }
 }
@@ -195,7 +196,10 @@ where
         };
 
         // Hanya cancel kalau status belum terminal
-        if !matches!(order.status.as_str(), "completed" | "cancelled") {
+        if !matches!(
+            order.status.as_str(),
+            "completed" | "cancelled" | "searching"
+        ) {
             return Ok(None);
         }
 
@@ -289,6 +293,7 @@ where
                     fare_estimate: order.fare_estimate,
                     service_type: order.service_type.clone(),
                     created_at: order.created_at.clone(),
+                    rider_name: order.rider_name.clone(),
                 }),
                 distance_to_pickup_m: order.distance_km.unwrap_or_default(),
                 eta_to_pickup_min: 1000.0,

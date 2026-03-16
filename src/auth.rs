@@ -7,6 +7,7 @@ pub struct Claims {
     pub role: String, // "rider" | "driver"
     pub name: String,
     pub exp: usize, // Expiration time as UNIX timestamp
+    pub vehicle_type: String,
 }
 
 #[derive(Clone)]
@@ -21,7 +22,13 @@ impl JwtService {
         }
     }
 
-    pub fn sign(&self, user_id: &str, name: &str, role: &str) -> anyhow::Result<String> {
+    pub fn sign(
+        &self,
+        user_id: &str,
+        name: &str,
+        role: &str,
+        vehicle_type: &str,
+    ) -> anyhow::Result<String> {
         // PERBAIKAN: Gunakan TimeDelta atau Duration dengan cara yang benar
 
         let claims = Claims {
@@ -29,6 +36,7 @@ impl JwtService {
             role: role.to_string(),
             name: name.to_string(),
             exp: (chrono::Utc::now() + chrono::Duration::days(100)).timestamp() as usize,
+            vehicle_type: vehicle_type.to_string(),
         };
 
         encode(

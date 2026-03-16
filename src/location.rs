@@ -261,12 +261,9 @@ impl LocationService {
     ) -> Result<Vec<(String, f64)>> {
         Self::validate_coordinates(lat, lng)?;
 
-        // Get 9 grids to search
         let search_grids = Self::get_search_grids(lat, lng)?;
-
         let mut redis = self.redis.clone();
 
-        // FIX: Pipeline semua GEORADIUS queries sekaligus
         let mut pipe = redis::pipe();
 
         for geohash in &search_grids {
@@ -284,37 +281,45 @@ impl LocationService {
                 .arg("ASC");
         }
 
-        // Execute pipeline - return Vec<Vec<(String, f64)>>
-        let results: Vec<Vec<(String, f64)>> = pipe
+        // Redis return nested array
+        let raw: Vec<Vec<Vec<String>>> = pipe
             .query_async(&mut redis)
             .await
             .unwrap_or_else(|_| vec![vec![]; search_grids.len()]);
 
-        // Flatten & deduplicate
-        let mut seen = std::collections::HashSet::new();
-        let mut all_drivers: Vec<(String, f64)> = results
-            .into_iter()
-            .flatten()
-            .filter(|(id, _)| seen.insert(id.clone()))
-            .collect();
+        use std::collections::HashMap;
 
-        // Sort by distance
-        all_drivers.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-        all_drivers.truncate(MAX_DRIVERS);
+        let mut drivers_map: HashMap<String, f64> = HashMap::new();
 
-        // Convert km to meters
-        let result: Vec<_> = all_drivers
-            .into_iter()
-            .map(|(id, dist_km)| (id, dist_km * 1000.0))
-            .collect();
+        for grid in raw {
+            for item in grid {
+                if item.len() != 2 {
+                    continue;
+                }
 
-        tracing::debug!(
-            "Found {} nearby drivers in {} grids",
-            result.len(),
-            search_grids.len()
-        );
+                let id = item[0].clone();
 
-        Ok(result)
+                if let Ok(dist_km) = item[1].parse::<f64>() {
+                    let dist_m = dist_km * 1000.0;
+
+                    drivers_map
+                        .entry(id)
+                        .and_modify(|d| {
+                            if dist_m < *d {
+                                *d = dist_m;
+                            }
+                        })
+                        .or_insert(dist_m);
+                }
+            }
+        }
+
+        let mut drivers: Vec<(String, f64)> = drivers_map.into_iter().collect();
+
+        drivers.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        drivers.truncate(MAX_DRIVERS);
+
+        Ok(drivers)
     }
 
     // ── Get Driver Location ───────────────────────────────────────────────────

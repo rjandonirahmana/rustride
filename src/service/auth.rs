@@ -40,7 +40,9 @@ impl<R: UserRepository> AuthService<R> {
 
         let hashed = hash(&req.password, DEFAULT_COST)?;
         let user = self.repo.create(&req, &hashed).await?;
-        let token = self.jwt.sign(&user.id, &user.name, &user.role)?;
+        let token = self
+            .jwt
+            .sign(&user.id, &user.name, &user.role, &user.vehicle_type)?;
         Ok(AuthResponse { token, user })
     }
 
@@ -55,7 +57,9 @@ impl<R: UserRepository> AuthService<R> {
             bail!("Password salah");
         }
 
-        let token = self.jwt.sign(&user.id, &user.name, &user.role)?;
+        let token = self
+            .jwt
+            .sign(&user.id, &user.name, &user.role, &user.vehicle_type)?;
         Ok(AuthResponse { token, user })
     }
 }

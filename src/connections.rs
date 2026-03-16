@@ -1,4 +1,5 @@
 use crate::proto::ridehailing::ServerEvent;
+use crate::proto::ridehailing::{server_event::Payload as Sp, ErrorEvent};
 use anyhow::Result;
 use dashmap::{DashMap, DashSet};
 use futures::StreamExt;
@@ -15,19 +16,23 @@ pub struct ConnectionManager {
     channels: DashMap<Arc<str>, Tx>,
     drivers: DashSet<Arc<str>>,
     riders: DashSet<Arc<str>>,
-    redis: redis::aio::ConnectionManager,
+    redis: Arc<redis::aio::ConnectionManager>,
     redis_tx: Sender<(String, Vec<u8>)>,
 }
 
 impl ConnectionManager {
     pub fn new(redis: redis::aio::ConnectionManager, redis_client: redis::Client) -> Arc<Self> {
         let (redis_tx, mut redis_rx) = mpsc::channel::<(String, Vec<u8>)>(512);
-        let mut pub_redis = redis.clone();
 
-        // 1 publish worker — 1 Redis connection untuk semua publish
+        let redis = Arc::new(redis);
+        let pub_redis = redis.clone();
+
+        // 1 publish worker
         tokio::spawn(async move {
+            let mut conn = pub_redis.as_ref().clone();
+
             while let Some((channel, bytes)) = redis_rx.recv().await {
-                if let Err(e) = pub_redis.publish::<_, _, ()>(&channel, bytes).await {
+                if let Err(e) = conn.publish::<_, _, ()>(&channel, bytes).await {
                     tracing::warn!("Redis publish error: {}", e);
                 }
             }
@@ -41,9 +46,6 @@ impl ConnectionManager {
             redis_tx,
         });
 
-        // 1 shared subscriber untuk semua user — bukan per-user
-        // Sebelumnya: 100k user = 100k Redis connection (OOM)
-        // Sekarang:   1 Redis connection, routing di aplikasi
         Self::spawn_shared_subscriber(mgr.clone(), redis_client);
 
         mgr
@@ -76,7 +78,13 @@ impl ConnectionManager {
                                 _ => continue,
                             };
 
-                            let bytes: Vec<u8> = msg.get_payload().unwrap_or_default();
+                            let bytes: Vec<u8> = match msg.get_payload() {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    tracing::warn!("Invalid redis payload: {}", e);
+                                    continue;
+                                }
+                            };
                             match ServerEvent::decode(bytes.as_slice()) {
                                 Ok(event) => {
                                     if let Some(tx) = mgr.channels.get(user_id) {
@@ -118,7 +126,7 @@ impl ConnectionManager {
         self.drivers.remove(user_id);
         self.riders.remove(user_id);
 
-        let mut redis = self.redis.clone();
+        let mut redis = self.redis.as_ref().clone();
         let _: Result<(), _> = redis.del(format!("online:rider:{}", user_id)).await;
         let _: Result<(), _> = redis.del(format!("online:driver:{}", user_id)).await;
     }
@@ -127,7 +135,7 @@ impl ConnectionManager {
 
     pub async fn register_driver(&self, driver_id: &str) {
         self.drivers.insert(driver_id.into());
-        let mut redis = self.redis.clone();
+        let mut redis = self.redis.as_ref().clone();
         let _: Result<(), _> = redis
             .set_ex(format!("online:driver:{}", driver_id), "1", 300u64)
             .await;
@@ -135,14 +143,14 @@ impl ConnectionManager {
 
     pub async fn register_rider(&self, rider_id: &str) {
         self.riders.insert(rider_id.into());
-        let mut redis = self.redis.clone();
+        let mut redis = self.redis.as_ref().clone();
         let _: Result<(), _> = redis
             .set_ex(format!("online:rider:{}", rider_id), "1", 300u64)
             .await;
     }
 
     pub async fn refresh_ttl(&self, user_id: &str, role: &str) {
-        let mut redis = self.redis.clone();
+        let mut redis = self.redis.as_ref().clone();
         let key = format!("online:{}:{}", role, user_id);
         if let Err(e) = redis.expire::<_, ()>(key, 300).await {
             tracing::warn!(user_id, "refresh_ttl failed: {}", e);
@@ -156,21 +164,34 @@ impl ConnectionManager {
             match tx.try_send(Ok(event.clone())) {
                 Ok(_) => return,
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    tracing::warn!(user_id, "Channel full, dropping connection");
+                    tracing::warn!(user_id, "Channel full, disconnecting client");
+
+                    // Send error event sebelum disconnect
+                    if let Err(e) = tx.try_send(Ok(ServerEvent {
+                        payload: Some(Sp::Error(ErrorEvent {
+                            code: "CHANNEL_OVERFLOW".to_string(),
+                            message: "Server connection buffer full, reconnect".to_string(),
+                        })),
+                    })) {
+                        tracing::warn!(user_id, "Failed to send overflow error: {}", e);
+                    }
+
                     drop(tx);
                     self.channels.remove(user_id);
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::debug!(user_id, "Channel already closed");
                     drop(tx);
                     self.channels.remove(user_id);
                 }
             }
-        }
-
-        let bytes = event.encode_to_vec();
-        let channel = format!("evt:{}", user_id);
-        if self.redis_tx.try_send((channel, bytes)).is_err() {
-            tracing::warn!(user_id, "Redis queue full, event dropped");
+        } else {
+            // User not connected locally, try Redis
+            let bytes = event.encode_to_vec();
+            let channel = format!("evt:{}", user_id);
+            if self.redis_tx.try_send((channel, bytes)).is_err() {
+                tracing::warn!(user_id, "Redis queue full, event dropped");
+            }
         }
     }
 
@@ -200,7 +221,7 @@ impl ConnectionManager {
         if self.channels.contains_key(user_id) {
             return true;
         }
-        let mut redis = self.redis.clone();
+        let mut redis = self.redis.as_ref().clone();
         if redis
             .exists::<_, bool>(format!("online:rider:{}", user_id))
             .await

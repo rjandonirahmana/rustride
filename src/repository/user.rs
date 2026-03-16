@@ -33,7 +33,7 @@ impl MySqlUserRepository {
     /// Kolom SELECT standar untuk tabel users (alias u).
     fn user_cols() -> &'static str {
         r#"u.id, u.name, u.phone, u.email, u.password, u.role, u.avatar_url,
-           DATE_FORMAT(CONVERT_TZ(u.created_at,'+00:00','+00:00'),'%Y-%m-%dT%H:%i:%sZ') AS created_at_fmt"#
+           DATE_FORMAT(CONVERT_TZ(u.created_at,'+00:00','+00:00'),'%Y-%m-%dT%H:%i:%sZ') AS created_at_fmt, IFNULL(dp.vehicle_type, '') as vehicle_type"#
     }
 
     fn row_to_user(row: &Row) -> Result<User> {
@@ -46,6 +46,7 @@ impl MySqlUserRepository {
             role: from_value(col(row, "role")?),
             avatar_url: col_opt_str(row, "avatar_url"),
             created_at: from_value(col(row, "created_at_fmt")?),
+            vehicle_type: from_value(col(row, "vehicle_type")?),
         })
     }
 
@@ -107,7 +108,7 @@ impl UserRepository for MySqlUserRepository {
     }
 
     async fn find_by_id(&self, id: &str) -> Result<Option<User>> {
-        let q = format!("SELECT {} FROM users u WHERE u.id = ?", Self::user_cols());
+        let q = format!("SELECT {} FROM users u LEFT JOIN  driver_profiles dp ON u.id = dp.user_id WHERE u.id = ?", Self::user_cols());
         let rows = exec_rows(&self.pool, &q, (id,)).await?;
         rows.into_iter()
             .next()
@@ -117,7 +118,7 @@ impl UserRepository for MySqlUserRepository {
 
     async fn find_by_phone(&self, phone: &str) -> Result<Option<User>> {
         let q = format!(
-            "SELECT {} FROM users u WHERE u.phone = ?",
+            "SELECT {} FROM users u LEFT JOIN  driver_profiles dp ON u.id = dp.user_id WHERE u.phone = ?",
             Self::user_cols()
         );
         let rows = exec_rows(&self.pool, &q, (phone,)).await?;
@@ -130,11 +131,11 @@ impl UserRepository for MySqlUserRepository {
     async fn find_driver_by_id(&self, id: &str) -> Result<Option<(User, DriverProfile)>> {
         let q = format!(
             r#"SELECT {}, dp.user_id AS dp_user_id,
-               dp.vehicle_type, dp.vehicle_plate, dp.vehicle_model,
-               dp.vehicle_color, dp.rating, dp.total_trips, dp.is_active
-               FROM users u
-               JOIN driver_profiles dp ON dp.user_id = u.id
-               WHERE u.id = ?"#,
+           dp.vehicle_type, dp.vehicle_plate, dp.vehicle_model,
+           dp.vehicle_color, dp.rating, dp.total_trips, dp.is_active
+           FROM users u
+           INNER JOIN driver_profiles dp ON u.id = dp.user_id
+           WHERE u.id = ? AND u.role = 'driver'"#,
             Self::user_cols()
         );
         let rows = exec_rows(&self.pool, &q, (id,)).await?;
@@ -157,7 +158,7 @@ impl UserRepository for MySqlUserRepository {
             r#"SELECT {}, dp.user_id AS dp_user_id,
                dp.vehicle_type, dp.vehicle_plate, dp.vehicle_model,
                dp.vehicle_color, dp.rating, dp.total_trips, dp.is_active
-               FROM users u
+               FROM users u LEFT JOIN  driver_profiles dp ON u.id = dp.user_id
                JOIN driver_profiles dp ON dp.user_id = u.id
                WHERE u.id IN ({}) AND dp.is_active = 1"#,
             Self::user_cols(),

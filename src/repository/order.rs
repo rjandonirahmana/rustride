@@ -40,6 +40,7 @@ pub trait OrderRepository: Send + Sync {
         comment: &str,
     ) -> Result<()>;
     async fn find_active_for_driver(&self, driver_id: &str) -> Result<Option<Order>>;
+    async fn get_by_user_id(&self, user_id: &str) -> Result<Vec<Order>>;
 }
 
 /// DTO untuk membuat order baru
@@ -73,7 +74,7 @@ impl MySqlOrderRepository {
            o.pickup_lat, o.pickup_lng, o.pickup_address,
            o.dest_lat, o.dest_lng, o.dest_address,
            o.distance_km, o.fare_estimate, o.fare_final, o.service_type,
-           DATE_FORMAT(CONVERT_TZ(o.created_at,'+00:00','+00:00'),'%Y-%m-%dT%H:%i:%sZ') AS created_at_fmt"#
+           DATE_FORMAT(CONVERT_TZ(o.created_at,'+00:00','+00:00'),'%Y-%m-%dT%H:%i:%sZ') AS created_at_fmt, u.name as rider_name"#
     }
 
     fn row_to_order(row: &Row) -> Result<Order> {
@@ -105,6 +106,7 @@ impl MySqlOrderRepository {
             fare_final: col_opt_i32(row, "fare_final"),
             service_type: from_value(col(row, "service_type")?),
             created_at: from_value(col(row, "created_at_fmt")?),
+            rider_name: from_value(col(row, "rider_name")?),
         })
     }
 }
@@ -148,7 +150,7 @@ impl OrderRepository for MySqlOrderRepository {
         driver_id: &str,
     ) -> anyhow::Result<Option<Order>> {
         let q = format!(
-            "SELECT {} FROM orders o 
+            "SELECT {} FROM orders o JOIN users u ON o.rider_id = u.id
          WHERE o.rider_id = :rider_id 
            AND o.driver_id = :driver_id 
            AND o.status IN ('driver_accepted', 'driver_arrived', 'on_trip') 
@@ -172,7 +174,10 @@ impl OrderRepository for MySqlOrderRepository {
     }
 
     async fn find_by_id(&self, id: &str) -> Result<Option<Order>> {
-        let q = format!("SELECT {} FROM orders o WHERE o.id = ?", Self::order_cols());
+        let q = format!(
+            "SELECT {} FROM orders o JOIN users u ON o.rider_id = u.id WHERE o.id = ?",
+            Self::order_cols()
+        );
         let rows = exec_rows(&self.pool, &q, (id,)).await?;
         rows.into_iter()
             .next()
@@ -185,7 +190,7 @@ impl OrderRepository for MySqlOrderRepository {
         let row: Option<mysql_async::Row> = conn
             .exec_first(
                 format!(
-                    "SELECT {} FROM orders o WHERE o.rider_id = ? AND o.status NOT IN ('completed', 'cancelled')",
+                    "SELECT {} FROM orders o JOIN users u ON o.rider_id = u.id WHERE o.rider_id = ? AND o.status NOT IN ('completed', 'cancelled', 'searching')",
                     Self::order_cols()
                 ),
                 (rider_id,),
@@ -198,7 +203,7 @@ impl OrderRepository for MySqlOrderRepository {
         let mut conn = self.pool.get_conn().await?;
         let row: Option<mysql_async::Row> = conn
             .exec_first(
-             format!("SELECT {} FROM orders o WHERE o.driver_id = ? AND o.status NOT IN ('completed', 'cancelled')", Self::order_cols()),
+             format!("SELECT {} FROM orders o JOIN users u ON o.rider_id = u.id WHERE o.driver_id = ? AND o.status NOT IN ('completed', 'cancelled', 'searching')", Self::order_cols()),
                 (driver_id,),
             )
             .await?;
@@ -225,7 +230,7 @@ impl OrderRepository for MySqlOrderRepository {
         radius_km: f64,
     ) -> Result<Vec<Order>> {
         let q = format!(
-            r#"SELECT {} FROM orders o
+            r#"SELECT {} FROM orders o JOIN users u ON o.rider_id = u.id
                WHERE o.status = 'searching'
                AND o.service_type = ?
                AND (
@@ -284,6 +289,17 @@ impl OrderRepository for MySqlOrderRepository {
         Ok(())
     }
 
+    async fn get_by_user_id(&self, user_id: &str) -> Result<Vec<Order>> {
+        let q = format!(
+            "SELECT {} FROM orders o JOIN users u ON o.rider_id = u.id
+         WHERE o.rider_id = ?",
+            Self::order_cols()
+        );
+        let rows: Vec<Row> = exec_rows(&self.pool, &q, (user_id,)).await?;
+
+        rows.iter().map(Self::row_to_order).collect()
+    }
+
     async fn submit_rating(
         &self,
         order_id: &str,
@@ -296,7 +312,7 @@ impl OrderRepository for MySqlOrderRepository {
         let id = Uuid::new_v4().to_string();
         let q = r#"INSERT INTO ratings
 (id, order_id, poster_id, target_id, score, comment, tip_amount, created_at)
-VALUES('', ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP(3))"#;
+VALUES(?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP(3))"#;
         exec_drop(
             &self.pool,
             q,
