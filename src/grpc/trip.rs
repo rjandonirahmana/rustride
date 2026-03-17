@@ -13,10 +13,10 @@ use crate::{
     proto::ridehailing::{
         app_service_server::AppService, client_event::Payload as Cp, server_event::Payload as Sp,
         CallEndedEvent, ClientEvent, ConnectedEvent, CurrentOrder, DriverInfo, ErrorEvent,
-        HistoryEvent, IceCandidateEvent, IncomingCallAnswer, IncomingCallOffer, NearbyOrderItem,
-        NearbyOrdersEvent, NearbyRideshareEvent, NewMessageEvent, Order, OrderCreatedEvent,
-        OrderStatusEvent, PongEvent, PresenceEvent, RideshareJoinedEvent, RideshareOpenedEvent,
-        ServerEvent,
+        GetUploadUrlRes, HistoryEvent, IceCandidateEvent, IncomingCallAnswer, IncomingCallOffer,
+        NearbyOrderItem, NearbyOrdersEvent, NearbyRideshareEvent, NewMessageEvent, Order,
+        OrderCreatedEvent, OrderStatusEvent, PongEvent, PresenceEvent, RideshareJoinedEvent,
+        RideshareOpenedEvent, SendMediaResponse, ServerEvent,
     },
     repository::{
         notification::NotificationRepositorytrait, order::OrderRepository,
@@ -737,16 +737,63 @@ async fn dispatch<OR, UR, RR, NR>(
             }
         }
 
-        // ── Kirim media ───────────────────────────────────────────────────────
-        Cp::SendMedia(m) => {
-            if m.bodyimage.is_empty() {
+        Cp::GetUploadUrl(req) => match chat_svc.get_upload_url(user_id, &req.mime).await {
+            Ok(d) => {
                 connections.send(
                     user_id,
-                    err_event("MISSING_body_data", "media body tidak boleh kosong"),
+                    ServerEvent {
+                        payload: Some(Sp::UploadUrlRes(GetUploadUrlRes {
+                            upload_url: (d.0),
+                            public_url: (d.1),
+                        })),
+                    },
+                );
+            }
+            Err(e) => {
+                connections.send(user_id, err_event("get upload url error", &e.to_string()));
+                return;
+            }
+        },
+
+        // ── Kirim media ───────────────────────────────────────────────────────
+        Cp::SendMedia(m) => {
+            if m.media_url.is_empty() {
+                connections.send(
+                    user_id,
+                    err_event("MISSING_URL", "media_url tidak boleh kosong"),
                 );
                 return;
             }
 
+            if !m
+                .media_url
+                .starts_with("http://vmi3152926.contaboserver.net/rustride/")
+            {
+                connections.send(user_id, err_event("INVALID_URL", "URL tidak valid"));
+                return;
+            }
+
+            if !m.media_mime.starts_with("image/")
+                && !m.media_mime.starts_with("video/")
+                && !m.media_mime.starts_with("audio/")
+            {
+                connections.send(
+                    user_id,
+                    err_event("INVALID_MIME", "Tipe file tidak didukung"),
+                );
+                return;
+            }
+
+            if !m.media_mime.starts_with("image/")
+                && !m.media_mime.starts_with("video/")
+                && !m.media_mime.starts_with("audio/")
+            {
+                connections.send(
+                    user_id,
+                    err_event("INVALID_MIME", "Tipe file tidak didukung"),
+                );
+                return;
+            }
             // 2. Load order
             let order = match order_svc.order_repo.find_by_id(&m.order_id).await {
                 Ok(Some(o)) => o,
@@ -800,12 +847,33 @@ async fn dispatch<OR, UR, RR, NR>(
             }
 
             // 6. Send media
-            if let Err(e) = chat_svc
-                .send_media(user_id, &peer_id, m.bodyimage, username, &order.id)
+            match chat_svc
+                .send_media(
+                    user_id,
+                    &peer_id,
+                    &m.media_url,
+                    &m.media_mime,
+                    m.media_size,
+                    username,
+                    &m.order_id,
+                )
                 .await
             {
-                tracing::error!(error = %e, "send_media failed");
-                connections.send(user_id, err_event("SEND_FAILED", &e.to_string()));
+                Err(e) => {
+                    tracing::error!(error = %e, "send_media failed");
+                    connections.send(user_id, err_event("SEND_FAILED", &e.to_string()));
+                }
+                Ok(d) => {
+                    connections.send(
+                        user_id,
+                        ServerEvent {
+                            payload: Some(Sp::SendMediaResponse(SendMediaResponse {
+                                client_msg_id: m.client_msg_id,
+                                msg_id: d.id,
+                            })),
+                        },
+                    );
+                }
             }
         }
 

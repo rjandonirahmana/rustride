@@ -87,6 +87,7 @@ message ClientEvent {
     CallAnswer          call_answer         = 33;
     IceCandidate        ice_candidate       = 34;
     EndCallReq          end_call            = 35;
+    GetUploadUrlReq get_upload_url = 36;
   }
 }
 
@@ -132,6 +133,8 @@ message ServerEvent {
     IceCandidateEvent    ice_candidate_event  = 28;
     CallEndedEvent       call_ended           = 29;
     CurrentOrder         current_order        = 30;
+    SendMediaResponse send_media_response = 31;
+    GetUploadUrlRes upload_url_res = 32;
 
   }
 }
@@ -144,6 +147,15 @@ message GetActivityUser {
   repeated Order orders = 1;
 }
 
+
+message GetUploadUrlReq {
+  string mime = 1;
+}
+
+message GetUploadUrlRes {
+  string upload_url = 1;
+  string public_url = 2;
+}
 message ConversationItem {
   string peer_id           = 1;
   string peer_name         = 2;
@@ -290,11 +302,14 @@ message OrderStatusEvent    { string order_id = 1; string status = 2; DriverInfo
 // ══════════════════════════════════════════════════════════════
   message SendMessageReq  { string recipient_id = 1; string content = 2; string order_id = 3; }
 
-  message SendMediaReq {
-    string recipient_id   = 1;
-    bytes bodyimage = 2;
-    string order_id       = 3;
-  }
+message SendMediaReq {
+  string client_msg_id = 1; // 🔥 dari client
+  string recipient_id  = 2;
+  string media_url     = 3;
+  string media_mime    = 4;
+  int64  media_size    = 5;
+  string order_id      = 6;
+}
 
   message MarkReadReq       { string from_user_id   = 1; }
 
@@ -324,7 +339,10 @@ message OrderStatusEvent    { string order_id = 1; string status = 2; DriverInfo
     string sender_avatar  = 13;
     string status_order   = 14;
   }
-
+message SendMediaResponse {
+  string client_msg_id = 1;
+  string msg_id        = 2;
+}
   message MessageAckEvent  { string msg_id = 1; string status = 2; string sent_at = 3; }
 
   message ReadReceiptEvent { string from_user_id = 1; string read_at = 2; }

@@ -66,56 +66,32 @@ impl ChatService {
         &self,
         sender_id: &str,
         recipient_id: &str,
-        databytes: Vec<u8>,
+        media_url: &str,
+        media_mime: &str,
+        media_size: i64,
         sender: &str,
         order_id: &str,
-    ) -> Result<()> {
+    ) -> Result<Message> {
         if sender_id == recipient_id {
             anyhow::bail!("Tidak bisa kirim ke diri sendiri");
         }
 
-        let detected_mime =
-            detect_mime(&databytes).ok_or_else(|| anyhow::anyhow!("Tidak bisa detect MIME"))?;
+        // 🔐 VALIDASI URL (WAJIB)
+        if !media_url.starts_with("http://vmi3152926.contaboserver.net/rustride/") {
+            anyhow::bail!("Invalid media URL");
+        }
 
-        // ✅ tentukan type
-        let msg_type = mime_to_type(detected_mime);
-
-        // ✅ ambil extension dari mime
-        let ext = match detected_mime {
-            "image/jpeg" => "jpg",
-            "image/png" => "png",
-            "image/webp" => "webp",
-            _ => "bin",
-        };
-
-        let file_id = Uuid::new_v4().to_string();
-        let key = format!("chat/{}/{}.{}", sender_id, file_id, ext);
-
-        // ✅ presigned upload URL
-        let presigned_req = self
-            .s3_client
-            .put_object()
-            .bucket("rustride")
-            .key(&key)
-            .content_type(detected_mime)
-            .presigned(PresigningConfig::expires_in(Duration::from_secs(300))?)
-            .await?;
-
-        let upload_url = presigned_req.uri().to_string();
-
-        // ✅ PUBLIC URL (buat ditampilkan di chat)
-        let media_url = format!("http://vmi3152926.contaboserver.net/{}/{}", "rustride", key);
-
-        let media_size = databytes.len() as i64;
+        // ✅ tentukan type dari mime
+        let msg_type = mime_to_type(media_mime);
 
         let mut msg = Message {
-            id: file_id,
+            id: uuid::Uuid::new_v4().to_string(),
             sender_id: sender_id.to_string(),
             recipient_id: recipient_id.to_string(),
             content: "".to_string(),
             msg_type: msg_type.to_string(),
-            media_url: Some(media_url),
-            media_mime: Some(detected_mime.to_string()),
+            media_url: Some(media_url.to_string()),
+            media_mime: Some(media_mime.to_string()),
             media_size: Some(media_size),
             media_duration: None,
             media_thumb: None,
@@ -132,13 +108,42 @@ impl ChatService {
 
         self.msg_repo.save(&mut msg).await?;
 
-        // 🔥 kirim ke user lain
+        // 🔥 push ke recipient
         self.push_message(&msg, sender).await;
 
-        // ✅ return upload URL ke client
-        println!("UPLOAD URL: {}", upload_url);
+        Ok(msg)
+    }
 
-        Ok(())
+    pub async fn get_upload_url(
+        &self,
+        user_id: &str,
+        mime: &str,
+    ) -> anyhow::Result<(String, String)> {
+        let ext = match mime {
+            "image/jpeg" => "jpg",
+            "image/png" => "png",
+            "image/webp" => "webp",
+            "video/mp4" => "mp4",
+            _ => "bin",
+        };
+
+        let file_id = Uuid::new_v4().to_string();
+        let key = format!("chat/{}/{}.{}", user_id, file_id, ext);
+
+        let presigned = self
+            .s3_client
+            .put_object()
+            .bucket("rustride")
+            .key(&key)
+            .content_type(mime)
+            .presigned(PresigningConfig::expires_in(Duration::from_secs(300))?)
+            .await?;
+
+        let upload_url = presigned.uri().to_string();
+
+        let public_url = format!("http://vmi3152926.contaboserver.net/rustride/{}", key);
+
+        Ok((upload_url, public_url))
     }
 
     pub async fn get_conversations(&self, user_id: &str) -> Result<Vec<ConversationItem>> {
