@@ -1,3 +1,4 @@
+use aws_config::{meta::region::RegionProviderChain, BehaviorVersion, Region};
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -52,6 +53,26 @@ async fn main() -> anyhow::Result<()> {
     let redis_conn = redis::aio::ConnectionManager::new(redis_client.clone()).await?;
     tracing::info!("Redis connected");
 
+    let region_provider = RegionProviderChain::first_try(Some(Region::new("us-east-1")));
+
+    let config = aws_config::defaults(BehaviorVersion::v2026_01_12())
+        .region("us-east-1")
+        .endpoint_url("http://77.237.242.1:9000") // RustFS
+        .region(region_provider)
+        .credentials_provider(aws_sdk_s3::config::Credentials::new(
+            "rustridecompany",
+            "rustridecompany123",
+            None,
+            None,
+            "loaded",
+        ))
+        .load()
+        .await;
+
+    let s3 = aws_sdk_s3::Client::new(&config);
+
+    print!("{:?}", s3.get_bucket_acl());
+
     // ── Repositories & services ───────────────────────────────────────────────
     let jwt = JwtService::new(&cfg.jwt_secret);
     let user_repo = Arc::new(MySqlUserRepository::new(pool.clone()));
@@ -72,6 +93,7 @@ async fn main() -> anyhow::Result<()> {
     let service_chat = service::chat::ChatService {
         msg_repo: message_repo.clone(),
         connections: state.connections.clone(),
+        s3_client: Arc::new(s3),
     };
 
     // ── gRPC server ───────────────────────────────────────────────────────────

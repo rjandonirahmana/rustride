@@ -739,10 +739,10 @@ async fn dispatch<OR, UR, RR, NR>(
 
         // ── Kirim media ───────────────────────────────────────────────────────
         Cp::SendMedia(m) => {
-            if m.media_url.trim().is_empty() {
+            if m.bodyimage.is_empty() {
                 connections.send(
                     user_id,
-                    err_event("MISSING_URL", "media_url tidak boleh kosong"),
+                    err_event("MISSING_body_data", "media body tidak boleh kosong"),
                 );
                 return;
             }
@@ -801,18 +801,7 @@ async fn dispatch<OR, UR, RR, NR>(
 
             // 6. Send media
             if let Err(e) = chat_svc
-                .send_media(
-                    user_id,
-                    &peer_id,
-                    &m.caption,
-                    &m.media_url,
-                    &m.media_mime,
-                    m.media_size,
-                    m.media_duration,
-                    &m.media_thumb,
-                    username,
-                    &order.id,
-                )
+                .send_media(user_id, &peer_id, m.bodyimage, username, &order.id)
                 .await
             {
                 tracing::error!(error = %e, "send_media failed");

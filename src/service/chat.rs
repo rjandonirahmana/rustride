@@ -1,5 +1,7 @@
 use anyhow::Result;
-use std::sync::Arc;
+use aws_sdk_s3::presigning::PresigningConfig;
+use prost::bytes;
+use std::{sync::Arc, time::Duration};
 use uuid::Uuid;
 
 use crate::{
@@ -15,6 +17,7 @@ use crate::{
 pub struct ChatService {
     pub msg_repo: Arc<MessageRepository>,
     pub connections: Arc<ConnectionManager>,
+    pub s3_client: Arc<aws_sdk_s3::Client>,
 }
 
 impl ChatService {
@@ -63,28 +66,59 @@ impl ChatService {
         &self,
         sender_id: &str,
         recipient_id: &str,
-        caption: &str,
-        media_url: &str,
-        media_mime: &str,
-        media_size: i64,
-        media_duration: i32,
-        media_thumb: &str,
+        databytes: Vec<u8>,
         sender: &str,
         order_id: &str,
     ) -> Result<()> {
-        let msg_type = mime_to_type(media_mime);
+        if sender_id == recipient_id {
+            anyhow::bail!("Tidak bisa kirim ke diri sendiri");
+        }
+
+        let detected_mime =
+            detect_mime(&databytes).ok_or_else(|| anyhow::anyhow!("Tidak bisa detect MIME"))?;
+
+        // ✅ tentukan type
+        let msg_type = mime_to_type(detected_mime);
+
+        // ✅ ambil extension dari mime
+        let ext = match detected_mime {
+            "image/jpeg" => "jpg",
+            "image/png" => "png",
+            "image/webp" => "webp",
+            _ => "bin",
+        };
+
+        let file_id = Uuid::new_v4().to_string();
+        let key = format!("chat/{}/{}.{}", sender_id, file_id, ext);
+
+        // ✅ presigned upload URL
+        let presigned_req = self
+            .s3_client
+            .put_object()
+            .bucket("rustride")
+            .key(&key)
+            .content_type(detected_mime)
+            .presigned(PresigningConfig::expires_in(Duration::from_secs(300))?)
+            .await?;
+
+        let upload_url = presigned_req.uri().to_string();
+
+        // ✅ PUBLIC URL (buat ditampilkan di chat)
+        let media_url = format!("http://vmi3152926.contaboserver.net/{}/{}", "rustride", key);
+
+        let media_size = databytes.len() as i64;
 
         let mut msg = Message {
-            id: Uuid::new_v4().to_string(),
+            id: file_id,
             sender_id: sender_id.to_string(),
             recipient_id: recipient_id.to_string(),
-            content: caption.to_string(),
+            content: "".to_string(),
             msg_type: msg_type.to_string(),
-            media_url: Some(media_url.to_string()),
-            media_mime: Some(media_mime.to_string()),
-            media_size: (media_size > 0).then_some(media_size),
-            media_duration: (media_duration > 0).then_some(media_duration),
-            media_thumb: (!media_thumb.is_empty()).then_some(media_thumb.to_string()),
+            media_url: Some(media_url),
+            media_mime: Some(detected_mime.to_string()),
+            media_size: Some(media_size),
+            media_duration: None,
+            media_thumb: None,
             sent_at: chrono::Utc::now()
                 .format("%Y-%m-%d %H:%M:%S%.3f")
                 .to_string(),
@@ -97,7 +131,13 @@ impl ChatService {
         };
 
         self.msg_repo.save(&mut msg).await?;
+
+        // 🔥 kirim ke user lain
         self.push_message(&msg, sender).await;
+
+        // ✅ return upload URL ke client
+        println!("UPLOAD URL: {}", upload_url);
+
         Ok(())
     }
 
@@ -186,13 +226,17 @@ impl ChatService {
     }
 }
 
+fn detect_mime(bytes: &[u8]) -> Option<&'static str> {
+    infer::get(bytes).map(|kind| kind.mime_type())
+}
+
 fn mime_to_type(mime: &str) -> &'static str {
     if mime.starts_with("image/") {
         "image"
-    } else if mime.starts_with("audio/") {
-        "audio"
     } else if mime.starts_with("video/") {
         "video"
+    } else if mime.starts_with("audio/") {
+        "audio"
     } else {
         "file"
     }

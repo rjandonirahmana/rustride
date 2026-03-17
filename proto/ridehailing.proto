@@ -292,13 +292,8 @@ message OrderStatusEvent    { string order_id = 1; string status = 2; DriverInfo
 
   message SendMediaReq {
     string recipient_id   = 1;
-    string caption        = 2;
-    string media_url      = 3;
-    string media_mime     = 4;
-    int64  media_size     = 5;
-    int32  media_duration = 6;
-    string media_thumb    = 7;
-    string order_id       = 8;
+    bytes bodyimage = 2;
+    string order_id       = 3;
   }
 
   message MarkReadReq       { string from_user_id   = 1; }
