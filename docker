@@ -1,19 +1,21 @@
-# Stage 1: Build
-FROM rust:latest AS builder
+# Stage 1: Build (Penting: Gunakan target musl)
+FROM rust:1.84-alpine AS builder
+
+# Instal dependensi build yang diperlukan Alpine
+RUN apk add --no-cache musl-dev protobuf-dev
 
 WORKDIR /app
-
-RUN apt-get update && apt-get install -y protobuf-compiler
-
 COPY . .
 
-RUN cargo build --release
+# Build khusus untuk target x86_64-unknown-linux-musl
+RUN cargo build --release --target x86_64-unknown-linux-musl
 
-# Stage 2: Runtime
-FROM debian:bookworm-slim
+# Stage 2: Runtime (Sangat irit memori)
+FROM alpine:latest
 
 WORKDIR /usr/local/bin
 
-COPY --from=builder /app/target/release/ridehailing .
+# Ambil binary dari folder target musl
+COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/ridehailing .
 
 CMD ["./ridehailing"]
