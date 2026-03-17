@@ -2,6 +2,15 @@
 FROM rustlang/rust:nightly-alpine AS builder
 
 # Instal dependensi build Alpine
+# Tambahkan zlib-static dan zlib-dev agar tidak error "cannot find -lz"
+RUN apk add --no-cache \
+    musl-dev \
+    protobuf-dev \
+    g++ \
+    make \
+    zlib-dev \
+    zlib-static
+
 RUN apk add --no-cache musl-dev protobuf-dev g++ make
 
 WORKDIR /app
