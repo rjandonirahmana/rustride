@@ -1,21 +1,23 @@
-# Stage 1: Build (Penting: Gunakan target musl)
-FROM rust:1.84-alpine AS builder
+# Stage 1: Build (Gunakan nightly agar mendukung Edition 2024)
+FROM rustlang/rust:nightly-alpine AS builder
 
-# Instal dependensi build yang diperlukan Alpine
-RUN apk add --no-cache musl-dev protobuf-dev
+# Instal dependensi build Alpine
+RUN apk add --no-cache musl-dev protobuf-dev g++ make
 
 WORKDIR /app
 COPY . .
 
-# Build khusus untuk target x86_64-unknown-linux-musl
+# Build untuk target musl
 RUN cargo build --release --target x86_64-unknown-linux-musl
 
-# Stage 2: Runtime (Sangat irit memori)
+# Stage 2: Runtime
 FROM alpine:latest
+
+# Instal runtime library jika diperlukan (opsional, tapi disarankan)
+RUN apk add --no-cache libgcc
 
 WORKDIR /usr/local/bin
 
-# Ambil binary dari folder target musl
 COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/ridehailing .
 
 CMD ["./ridehailing"]
