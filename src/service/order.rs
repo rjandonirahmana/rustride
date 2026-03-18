@@ -6,7 +6,7 @@ use anyhow::{bail, Result};
 use std::{collections::HashSet, sync::Arc};
 
 use crate::{
-    connections::ConnectionManager,
+    connections::{ConnectionManager, Priority},
     location::{haversine_m, LocationService},
     models::order::{NearbyOrder, Order},
     proto::ridehailing::{
@@ -55,8 +55,8 @@ fn status_event(
     status: &str,
     service_tye: &str,
     fare_estimate: &i32,
-) -> ServerEvent {
-    ServerEvent {
+) -> Arc<ServerEvent> {
+    Arc::new(ServerEvent {
         payload: Some(Sp::OrderStatus(OrderStatusEvent {
             order_id: order_id.to_string(),
             status: status.to_string(),
@@ -64,7 +64,7 @@ fn status_event(
             service_type: service_tye.to_string(),
             fare_estimate: *fare_estimate,
         })),
-    }
+    })
 }
 
 // ── OrderService ──────────────────────────────────────────────────────────────
@@ -152,6 +152,7 @@ where
                 &order.service_type,
                 &order.fare_estimate,
             ),
+            Priority::Normal,
         );
 
         // Spawn background driver matching
@@ -214,7 +215,7 @@ where
             // Notify rider
             self.connections.send(
                 &order.rider_id,
-                ServerEvent {
+                Arc::new(ServerEvent {
                     payload: Some(Sp::OrderStatus(OrderStatusEvent {
                         order_id: order_id.clone(),
                         status: "cancelled".to_string(),
@@ -222,7 +223,8 @@ where
                         service_type: order.service_type.clone(),
                         fare_estimate: order.fare_estimate,
                     })),
-                },
+                }),
+                Priority::Normal,
             );
         } else {
             // Rider yang disconnect — notify driver kalau ada
@@ -230,7 +232,7 @@ where
                 let _ = self.location.clear_driver_order(driver_id).await;
                 self.connections.send(
                     driver_id,
-                    ServerEvent {
+                    Arc::new(ServerEvent {
                         payload: Some(Sp::OrderStatus(OrderStatusEvent {
                             order_id: order_id.clone(),
                             status: "cancelled".to_string(),
@@ -238,7 +240,8 @@ where
                             service_type: order.service_type.clone(),
                             fare_estimate: order.fare_estimate,
                         })),
-                    },
+                    }),
+                    Priority::Normal,
                 );
             }
         }
@@ -269,7 +272,7 @@ where
             {
                 continue;
             }
-            eligible_ids.push(driver_id.clone());
+            eligible_ids.push(driver_id.clone().to_string());
         }
 
         if eligible_ids.is_empty() {
@@ -301,7 +304,8 @@ where
             })),
         };
 
-        self.connections.send_to_drivers(&eligible_ids, event);
+        self.connections
+            .send_to_drivers(eligible_ids, Arc::new(event), Priority::Normal);
         Ok(())
     }
 
@@ -419,7 +423,7 @@ where
                     // Notify rider masih mencari
                     self.connections.send(
                         &order.rider_id,
-                        ServerEvent {
+                        Arc::new(ServerEvent {
                             payload: Some(Sp::OrderStatus(OrderStatusEvent {
                                 order_id: order.id.clone(),
                                 status: "searching".to_string(),
@@ -427,7 +431,8 @@ where
                                 service_type: order.service_type.clone(),
                                 fare_estimate: order.fare_estimate,
                             })),
-                        },
+                        }),
+                        Priority::Normal,
                     );
                     tokio::time::sleep(tokio::time::Duration::from_secs(RETRY_DELAY_SECS)).await;
                     continue;
@@ -447,14 +452,15 @@ where
 
             self.connections.send(
                 &best.driver_id,
-                ServerEvent {
+                Arc::new(ServerEvent {
                     payload: Some(Sp::NewOrder(NewOrderOffer {
                         order: Some(order_to_proto(&order)),
                         distance_to_pickup_m: best.dist_m as f32,
                         eta_to_pickup_min: eta_min,
                         timeout_secs: OFFER_TIMEOUT as u32,
                     })),
-                },
+                }),
+                Priority::Normal,
             );
 
             // Tunggu response driver
@@ -508,7 +514,7 @@ where
         // Notify rider
         self.connections.send(
             &order.rider_id,
-            ServerEvent {
+            Arc::new(ServerEvent {
                 payload: Some(Sp::OrderStatus(OrderStatusEvent {
                     order_id: order_id.to_string(),
                     status: "driver_found".to_string(),
@@ -516,13 +522,14 @@ where
                     service_type: order.service_type.clone(),
                     fare_estimate: order.fare_estimate,
                 })),
-            },
+            }),
+            Priority::Normal,
         );
 
         // Notify driver
         self.connections.send(
             driver_id,
-            ServerEvent {
+            Arc::new(ServerEvent {
                 payload: Some(Sp::OrderStatus(OrderStatusEvent {
                     order_id: order_id.to_string(),
                     status: "driver_accepted".to_string(),
@@ -530,7 +537,8 @@ where
                     service_type: order.service_type,
                     fare_estimate: order.fare_estimate,
                 })),
-            },
+            }),
+            Priority::Normal,
         );
 
         let updated = self.order_repo.find_by_id(order_id).await?.unwrap();
@@ -553,6 +561,7 @@ where
                 &order.service_type,
                 &order.fare_estimate,
             ),
+            Priority::Normal,
         );
         self.connections.send(
             driver_id,
@@ -562,6 +571,7 @@ where
                 &order.service_type,
                 &order.fare_estimate,
             ),
+            Priority::Normal,
         );
         Ok(())
     }
@@ -580,6 +590,7 @@ where
                 &order.service_type,
                 &order.fare_estimate,
             ),
+            Priority::Normal,
         );
         self.connections.send(
             driver_id,
@@ -589,6 +600,7 @@ where
                 &order.service_type,
                 &order.fare_estimate,
             ),
+            Priority::Normal,
         );
         Ok(())
     }
@@ -609,6 +621,7 @@ where
                 &order.service_type,
                 &order.fare_estimate,
             ),
+            Priority::Normal,
         );
         self.connections.send(
             driver_id,
@@ -618,6 +631,7 @@ where
                 &order.service_type,
                 &order.fare_estimate,
             ),
+            Priority::Normal,
         );
         Ok(())
     }
@@ -661,6 +675,7 @@ where
                         &order.service_type,
                         &order.fare_estimate,
                     ),
+                    Priority::Normal,
                 );
             }
         }
@@ -673,6 +688,7 @@ where
                     &order.service_type,
                     &order.fare_estimate,
                 ),
+                Priority::Normal,
             );
         }
         self.connections.send(
@@ -683,6 +699,7 @@ where
                 &order.service_type,
                 &order.fare_estimate,
             ),
+            Priority::Normal,
         );
         Ok(())
     }
@@ -728,14 +745,15 @@ where
             .ok_or_else(|| anyhow::anyhow!("Order tidak ditemukan"))?;
         self.connections.send(
             &order.rider_id,
-            ServerEvent {
+            Arc::new(ServerEvent {
                 payload: Some(Sp::DriverLoc(DriverLocationEvent {
                     order_id: order_id.to_string(),
                     lat,
                     lng,
                     heading,
                 })),
-            },
+            }),
+            Priority::Normal,
         );
         Ok(())
     }

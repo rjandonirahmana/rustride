@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::{
-    connections::ConnectionManager,
+    connections::{ConnectionManager, Priority},
     proto::ridehailing::{
         server_event::Payload as Sp, NewNotificationEvent, NotificationItem, NotificationsEvent,
         ServerEvent,
@@ -42,7 +42,7 @@ impl<NR: NotificationRepositorytrait + 'static> NotificationService<NR> {
         // Jika user online, push realtime
         self.connections.send(
             user_id,
-            ServerEvent {
+            Arc::new(ServerEvent {
                 payload: Some(Sp::NewNotification(NewNotificationEvent {
                     notification: Some(NotificationItem {
                         id: notif_id,
@@ -56,7 +56,8 @@ impl<NR: NotificationRepositorytrait + 'static> NotificationService<NR> {
                         created_at: chrono::Utc::now().to_rfc3339(),
                     }),
                 })),
-            },
+            }),
+            Priority::Normal,
         );
 
         Ok(())

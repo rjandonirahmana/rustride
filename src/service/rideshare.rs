@@ -1,10 +1,9 @@
 use std::sync::Arc;
 
 use crate::{
-    connections::ConnectionManager,
+    connections::{ConnectionManager, Priority},
     proto::ridehailing::{
-        server_event::Payload as Sp, NewNotificationEvent, NotificationItem, PassengerRequestEvent,
-        PassengerStatusEvent, RideshareItem, RideshareJoinedEvent, RideshareOpenedEvent,
+        server_event::Payload as Sp, PassengerRequestEvent, PassengerStatusEvent, RideshareItem,
         RideshareStatusEvent, ServerEvent,
     },
     repository::{
@@ -12,7 +11,6 @@ use crate::{
         rideshare::{RideshareOpenItem, RideshareRepositoryTrait},
         user::UserRepository,
     },
-    service::order::OrderService,
 };
 
 // ── Haversine helper ──────────────────────────────────────────────────────────
@@ -241,7 +239,7 @@ where
         // Kirim notif ke driver
         self.connections.send(
             &trip.driver_id,
-            ServerEvent {
+            Arc::new(ServerEvent {
                 payload: Some(Sp::PassengerRequest(PassengerRequestEvent {
                     passenger_id: passenger_id.clone(),
                     trip_id: trip_id.to_string(),
@@ -257,7 +255,8 @@ where
                     fare_estimate: fare,
                     distance_km: dist_to_driver as f32,
                 })),
-            },
+            }),
+            Priority::Normal,
         );
 
         // Simpan notif ke DB untuk driver
@@ -308,7 +307,7 @@ where
         // Notify rider
         self.connections.send(
             &passenger.rider_id,
-            ServerEvent {
+            Arc::new(ServerEvent {
                 payload: Some(Sp::PassengerStatus(PassengerStatusEvent {
                     passenger_id: passenger_id.to_string(),
                     trip_id: trip_id.to_string(),
@@ -316,7 +315,8 @@ where
                     reason: String::new(),
                     fare_estimate: passenger.fare_estimate,
                 })),
-            },
+            }),
+            Priority::Normal,
         );
 
         // Broadcast status trip (mungkin berubah ke "full")
@@ -370,7 +370,7 @@ where
 
         self.connections.send(
             &passenger.rider_id,
-            ServerEvent {
+            Arc::new(ServerEvent {
                 payload: Some(Sp::PassengerStatus(PassengerStatusEvent {
                     passenger_id: passenger_id.to_string(),
                     trip_id: trip_id.to_string(),
@@ -378,7 +378,8 @@ where
                     reason: reason.unwrap_or("").to_string(),
                     fare_estimate: 0,
                 })),
-            },
+            }),
+            Priority::Normal,
         );
 
         let _ = self
@@ -413,7 +414,7 @@ where
 
         self.connections.send(
             &passenger.rider_id,
-            ServerEvent {
+            Arc::new(ServerEvent {
                 payload: Some(Sp::PassengerStatus(PassengerStatusEvent {
                     passenger_id: passenger_id.to_string(),
                     trip_id: trip_id.to_string(),
@@ -421,7 +422,8 @@ where
                     reason: String::new(),
                     fare_estimate: passenger.fare_estimate,
                 })),
-            },
+            }),
+            Priority::Normal,
         );
 
         self.broadcast_trip_status(trip_id, Some(passenger_id), "picked_up")
@@ -454,7 +456,7 @@ where
 
         self.connections.send(
             &passenger.rider_id,
-            ServerEvent {
+            Arc::new(ServerEvent {
                 payload: Some(Sp::PassengerStatus(PassengerStatusEvent {
                     passenger_id: passenger_id.to_string(),
                     trip_id: trip_id.to_string(),
@@ -462,7 +464,8 @@ where
                     reason: String::new(),
                     fare_estimate: fare_final,
                 })),
-            },
+            }),
+            Priority::Normal,
         );
 
         // Notif selesai
@@ -515,7 +518,7 @@ where
         // Kirim update ke driver supaya list penumpang segar
         self.connections.send(
             &trip.driver_id,
-            ServerEvent {
+            Arc::new(ServerEvent {
                 payload: Some(Sp::RideshareStatus(RideshareStatusEvent {
                     trip_id: trip_id.to_string(),
                     status: trip.status.clone(),
@@ -523,7 +526,8 @@ where
                     passenger_id: passenger_id.to_string(),
                     passenger_status: "cancelled".to_string(),
                 })),
-            },
+            }),
+            Priority::Normal,
         );
 
         Ok(())
@@ -576,7 +580,8 @@ where
                     .iter()
                     .filter(|p| p.status == "accepted" || p.status == "picked_up")
                 {
-                    self.connections.send(&p.rider_id, event.clone());
+                    self.connections
+                        .send(&p.rider_id, Arc::new(event.clone()), Priority::Normal);
                 }
             }
         }

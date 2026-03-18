@@ -5,7 +5,7 @@ use std::{sync::Arc, time::Duration};
 use uuid::Uuid;
 
 use crate::{
-    connections::ConnectionManager,
+    connections::{ConnectionManager, Priority},
     models::message::Message,
     proto::ridehailing::{
         server_event::Payload as Sp, ConversationItem, MessageAckEvent, NewMessageEvent,
@@ -160,12 +160,13 @@ impl ChatService {
             .to_string();
         self.connections.send(
             sender_id,
-            ServerEvent {
+            Arc::new(ServerEvent {
                 payload: Some(Sp::ReadReceipt(ReadReceiptEvent {
                     from_user_id: reader_id.to_string(),
                     read_at,
                 })),
-            },
+            }),
+            Priority::Normal,
         );
         Ok(())
     }
@@ -210,18 +211,23 @@ impl ChatService {
         };
 
         // Push ke recipient
-        self.connections.send(&msg.recipient_id, event.clone());
+        self.connections.send(
+            &msg.recipient_id,
+            Arc::new(event.clone()),
+            Priority::Critical,
+        );
 
         // Ack ke sender
         self.connections.send(
             &msg.sender_id,
-            ServerEvent {
+            Arc::new(ServerEvent {
                 payload: Some(Sp::MessageAck(MessageAckEvent {
                     msg_id: msg.id.clone(),
                     status: "sent".to_string(),
                     sent_at: msg.sent_at.clone(),
                 })),
-            },
+            }),
+            Priority::Normal,
         );
 
         // Mark delivered kalau recipient online
