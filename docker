@@ -1,32 +1,28 @@
-# Stage 1: Build (Gunakan nightly agar mendukung Edition 2024)
+# Stage 1: Build
 FROM rustlang/rust:nightly-alpine AS builder
 
-# Instal dependensi build Alpine
-# Tambahkan zlib-static dan zlib-dev agar tidak error "cannot find -lz"
 RUN apk add --no-cache \
     musl-dev \
     protobuf-dev \
     g++ \
     make \
+    perl \
+    pkgconfig \
+    openssl-dev \
+    openssl-libs-static \
     zlib-dev \
     zlib-static
-
-RUN apk add --no-cache musl-dev protobuf-dev g++ make
 
 WORKDIR /app
 COPY . .
 
-# Build untuk target musl
+# Paksa openssl-sys pakai vendored (compile OpenSSL dari source, static link)
+ENV OPENSSL_STATIC=1
+ENV OPENSSL_VENDORED=1
+
 RUN cargo build --release --target x86_64-unknown-linux-musl
 
-# Stage 2: Runtime
-FROM alpine:latest
-
-# Instal runtime library jika diperlukan (opsional, tapi disarankan)
-RUN apk add --no-cache libgcc
-
-WORKDIR /usr/local/bin
-
-COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/ridehailing .
-
-CMD ["./ridehailing"]
+# Stage 2: Runtime — pakai scratch karena fully static binary
+FROM scratch
+COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/ridehailing /ridehailing
+CMD ["/ridehailing"]
