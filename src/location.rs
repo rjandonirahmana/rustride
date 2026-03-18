@@ -206,6 +206,29 @@ impl LocationService {
         Ok(())
     }
 
+    fn calculate_fare(
+        distance_m: f64,
+        duration_sec: u64,
+        service_type: &str,
+        surge_multiplier: f64,
+    ) -> f64 {
+        let (base_fare, per_km, per_min) = match service_type {
+            "mobil" => (5000.0, 3000.0, 500.0),
+            "motor" => (3000.0, 1500.0, 300.0),
+            "food" => (2000.0, 1000.0, 200.0),
+            _ => (0.0, 0.0, 0.0),
+        };
+
+        let distance_km = distance_m / 1000.0;
+        let duration_min = duration_sec as f64 / 60.0;
+
+        let fare = base_fare + (distance_km * per_km) + (duration_min * per_min);
+        let fare = fare * surge_multiplier;
+
+        // Terapkan minimum fare
+        fare.max(8000.0) // contoh minimum Rp8.000
+    }
+
     // ── Remove Driver ─────────────────────────────────────────────────────────
 
     pub async fn remove_driver(&self, driver_id: &str, service_type: &str) -> Result<()> {
@@ -250,6 +273,44 @@ impl LocationService {
         Ok(())
     }
 
+    pub async fn estimate_price(
+        &self,
+        pickup_lat: f64,
+        pickup_lng: f64,
+        dest_lat: f64,
+        dest_lng: f64,
+        service_type: &str,
+    ) -> Result<Option<f64>> {
+        let drivers = self
+            .find_nearby_drivers(pickup_lat, pickup_lng, service_type)
+            .await?;
+
+        if drivers.is_empty() {
+            return Ok(None);
+        }
+
+        // ambil driver terdekat
+        let (_, driver_to_pickup_m) = &drivers[0];
+
+        // jarak pickup → tujuan
+        let trip_m = haversine_m(pickup_lat, pickup_lng, dest_lat, dest_lng);
+
+        // total distance
+        let total_distance = driver_to_pickup_m + trip_m;
+
+        // estimasi waktu (simple)
+        let avg_speed_mps = 8.0; // ~28 km/h (motor urban)
+        let duration_sec = (total_distance / avg_speed_mps) as u64;
+
+        let fare = Self::calculate_fare(
+            total_distance,
+            duration_sec,
+            service_type,
+            1.0, // nanti bisa surge dinamis
+        );
+
+        Ok(Some(fare))
+    }
     // ── Find Nearby Drivers ───────────────────────────────────────────────────
 
     /// FIX: Gunakan pipeline untuk query semua grids sekaligus (5-10x faster)

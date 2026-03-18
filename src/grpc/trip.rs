@@ -95,9 +95,7 @@ where
 
         if role == "driver" {
             let _ = self.user_repo.set_driver_active(&user_id, true).await;
-            self.connections.register_driver(&user_id).await;
         } else if role == "rider" {
-            self.connections.register_rider(&user_id).await;
         }
 
         tracing::info!("userid {} connect {} {}", &user_id, &role, &vehicle_type);
