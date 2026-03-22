@@ -2,7 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use mysql_async::{from_value, prelude::Queryable, Pool, Row};
 
-use super::db::{col, col_opt_f32, col_opt_i32, col_opt_str, exec_rows};
+use super::db::{col, exec_rows};
 
 // ── Models ────────────────────────────────────────────────────────────────────
 
@@ -26,7 +26,7 @@ pub struct DriverOrderItem {
     pub rating_comment: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DailySummary {
     pub total_orders: i32,
     pub cancelled_orders: i32,
@@ -40,56 +40,36 @@ pub struct DailySummary {
     pub peak_hour: String,
 }
 
-impl Default for DailySummary {
-    fn default() -> Self {
-        Self {
-            total_orders: 0,
-            cancelled_orders: 0,
-            gross_earnings: 0,
-            platform_fee: 0,
-            net_earnings: 0,
-            tips: 0,
-            online_minutes: 0,
-            distance_km: 0.0,
-            avg_rating: 0.0,
-            peak_hour: String::new(),
-        }
-    }
-}
-
 #[derive(Debug)]
 pub struct OrderHistoryFilter {
-    pub date_from: Option<String>, // "YYYY-MM-DD"
+    pub date_from: Option<String>,
     pub date_to: Option<String>,
-    pub status: Option<String>, // "completed" | "cancelled" | None = semua
+    pub status: Option<String>,
+    pub service_type: Option<String>, // ← tambahan
     pub page: u32,
     pub limit: u32,
 }
 
-// ── Trait ─────────────────────────────────────────────────────────────────────
+// ── Earnings structs ──────────────────────────────────────────────────────────
 
-#[async_trait]
-pub trait DriverRepository: Send + Sync {
-    /// Ambil semua order hari ini milik driver.
-    async fn get_today_orders(&self, driver_id: &str) -> Result<Vec<DriverOrderItem>>;
+#[derive(Debug, Default)]
+pub struct EarningsResult {
+    pub gross_earnings: i64,
+    pub net_earnings: i64,
+    pub tips: i64,
+    pub trip_count: i32,
+    pub cancel_count: i32,
+    pub distance_km: f32,
+    pub online_minutes: i64,
+    pub daily: Vec<DailyEarningRow>,
+}
 
-    /// Ambil summary hari ini dari driver_daily_summary.
-    /// Return None kalau belum ada baris (driver belum pernah online hari ini).
-    async fn get_today_summary(&self, driver_id: &str) -> Result<Option<DailySummary>>;
-
-    /// History order dengan filter + pagination.
-    async fn get_order_history(
-        &self,
-        driver_id: &str,
-        filter: OrderHistoryFilter,
-    ) -> Result<(Vec<DriverOrderItem>, u32)>; // (items, total_count)
-
-    /// Detail satu order beserta route points.
-    async fn get_order_detail(
-        &self,
-        driver_id: &str,
-        order_id: &str,
-    ) -> Result<Option<DriverOrderDetail>>;
+#[derive(Debug)]
+pub struct DailyEarningRow {
+    pub date: String,
+    pub net_earnings: i64,
+    pub trip_count: i32,
+    pub distance_km: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +84,34 @@ pub struct DriverOrderDetail {
     pub rider_rating: f32,
 }
 
+// ── Trait ─────────────────────────────────────────────────────────────────────
+
+#[async_trait]
+pub trait DriverRepository: Send + Sync {
+    async fn get_today_orders(&self, driver_id: &str) -> Result<Vec<DriverOrderItem>>;
+
+    async fn get_today_summary(&self, driver_id: &str) -> Result<Option<DailySummary>>;
+
+    async fn get_order_history(
+        &self,
+        driver_id: &str,
+        filter: OrderHistoryFilter,
+    ) -> Result<(Vec<DriverOrderItem>, u32)>;
+
+    async fn get_order_detail(
+        &self,
+        driver_id: &str,
+        order_id: &str,
+    ) -> Result<Option<DriverOrderDetail>>;
+
+    async fn get_earnings(
+        &self,
+        driver_id: &str,
+        date_from: &str,
+        date_to: &str,
+    ) -> Result<EarningsResult>;
+}
+
 // ── MySQL implementasi ────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -116,37 +124,35 @@ impl MySqlDriverRepository {
         Self { pool }
     }
 
-    /// Kolom SELECT untuk daftar order driver.
-    /// Platform fee dihitung inline (20%).
     fn order_item_cols() -> &'static str {
         r#"
-            o.id                                                        AS order_id,
+            o.id                                                         AS order_id,
             o.status,
-            COALESCE(u.name, '')                                        AS rider_name,
+            COALESCE(u.name, '')                                         AS rider_name,
             o.pickup_address,
             o.dest_address,
-            COALESCE(o.distance_km, 0)                                  AS distance_km,
+            COALESCE(o.distance_km, 0)                                   AS distance_km,
             COALESCE(
                 TIMESTAMPDIFF(MINUTE, o.started_at, o.completed_at), 0
-            )                                                           AS duration_min,
-            COALESCE(o.fare_final, o.fare_estimate)                     AS fare,
-            FLOOR(COALESCE(o.fare_final, o.fare_estimate) * 0.80)       AS driver_earning,
+            )                                                            AS duration_min,
+            COALESCE(o.fare_final, o.fare_estimate)                      AS fare,
+            FLOOR(COALESCE(o.fare_final, o.fare_estimate) * 0.80)        AS driver_earning,
             COALESCE(
-                (SELECT SUM(r.tip_amount) FROM ratings r WHERE r.order_id = o.id
-                 AND r.target_id = o.driver_id), 0
-            )                                                           AS tip,
+                (SELECT SUM(r.tip_amount) FROM ratings r
+                 WHERE r.order_id = o.id AND r.target_id = o.driver_id), 0
+            )                                                            AS tip,
             o.service_type,
             COALESCE(DATE_FORMAT(o.started_at,   '%Y-%m-%dT%H:%i:%sZ'), '') AS started_at,
             COALESCE(DATE_FORMAT(o.completed_at, '%Y-%m-%dT%H:%i:%sZ'), '') AS completed_at,
-            COALESCE(o.cancel_reason, '')                               AS cancel_reason,
+            COALESCE(o.cancel_reason, '')                                AS cancel_reason,
             COALESCE(
-                (SELECT r.score FROM ratings r WHERE r.order_id = o.id
-                 AND r.target_id = o.driver_id LIMIT 1), 0
-            )                                                           AS rating,
+                (SELECT r.score FROM ratings r
+                 WHERE r.order_id = o.id AND r.target_id = o.driver_id LIMIT 1), 0
+            )                                                            AS rating,
             COALESCE(
-                (SELECT r.comment FROM ratings r WHERE r.order_id = o.id
-                 AND r.target_id = o.driver_id LIMIT 1), ''
-            )                                                           AS rating_comment
+                (SELECT r.comment FROM ratings r
+                 WHERE r.order_id = o.id AND r.target_id = o.driver_id LIMIT 1), ''
+            )                                                            AS rating_comment
         "#
     }
 
@@ -250,35 +256,39 @@ impl DriverRepository for MySqlDriverRepository {
         let limit = filter.limit.max(1).min(100);
         let offset = (filter.page.saturating_sub(1)) * limit;
 
-        // Build WHERE clauses dinamis
-        let mut where_parts = vec![
-            "o.driver_id = ?".to_string(),
-            "o.status IN ('completed', 'cancelled')".to_string(),
+        let mut where_parts: Vec<String> = vec![
+            "o.driver_id = ?".into(),
+            "o.status IN ('completed', 'cancelled')".into(),
         ];
         let mut binds: Vec<mysql_async::Value> = vec![driver_id.into()];
 
         if let Some(ref df) = filter.date_from {
-            where_parts.push("DATE(COALESCE(o.completed_at, o.cancelled_at)) >= ?".to_string());
+            where_parts.push("DATE(COALESCE(o.completed_at, o.cancelled_at)) >= ?".into());
             binds.push(df.as_str().into());
         }
         if let Some(ref dt) = filter.date_to {
-            where_parts.push("DATE(COALESCE(o.completed_at, o.cancelled_at)) <= ?".to_string());
+            where_parts.push("DATE(COALESCE(o.completed_at, o.cancelled_at)) <= ?".into());
             binds.push(dt.as_str().into());
         }
         if let Some(ref st) = filter.status {
-            where_parts.push("o.status = ?".to_string());
+            where_parts.push("o.status = ?".into());
             binds.push(st.as_str().into());
+        }
+        if let Some(ref svc) = filter.service_type {
+            where_parts.push("o.service_type = ?".into());
+            binds.push(svc.as_str().into());
         }
 
         let where_sql = where_parts.join(" AND ");
 
-        // Count total
+        // Total count
         let count_q = format!("SELECT COUNT(*) FROM orders o WHERE {}", where_sql);
         let total: u32 = conn.exec_first(&count_q, binds.clone()).await?.unwrap_or(0);
 
         // Fetch page
-        binds.push((limit as u64).into());
-        binds.push((offset as u64).into());
+        let mut page_binds = binds.clone();
+        page_binds.push((limit as u64).into());
+        page_binds.push((offset as u64).into());
 
         let data_q = format!(
             r#"SELECT {}
@@ -288,14 +298,15 @@ impl DriverRepository for MySqlDriverRepository {
                ORDER BY COALESCE(o.completed_at, o.cancelled_at) DESC
                LIMIT ? OFFSET ?"#,
             Self::order_item_cols(),
-            where_sql
+            where_sql,
         );
 
-        let rows: Vec<Row> = conn.exec(&data_q, binds).await?;
+        let rows: Vec<Row> = conn.exec(&data_q, page_binds).await?;
         let items = rows
             .iter()
             .map(Self::row_to_item)
             .collect::<Result<Vec<_>>>()?;
+
         Ok((items, total))
     }
 
@@ -310,8 +321,9 @@ impl DriverRepository for MySqlDriverRepository {
             .exec_first(
                 format!(
                     r#"SELECT {},
-                           o.pickup_lat, o.pickup_lng, o.dest_lat, o.dest_lng,
-                           COALESCE(u.phone, '')      AS rider_phone,
+                           o.pickup_lat, o.pickup_lng,
+                           o.dest_lat,   o.dest_lng,
+                           COALESCE(u.phone,      '') AS rider_phone,
                            COALESCE(u.avatar_url, '') AS rider_avatar,
                            COALESCE(
                                (SELECT AVG(r2.score) FROM ratings r2
@@ -341,5 +353,111 @@ impl DriverRepository for MySqlDriverRepository {
                 v as f32
             },
         }))
+    }
+
+    // ── Earnings multi-period ─────────────────────────────────────────────────
+    async fn get_earnings(
+        &self,
+        driver_id: &str,
+        date_from: &str,
+        date_to: &str,
+    ) -> Result<EarningsResult> {
+        let mut conn = self.pool.get_conn().await?;
+
+        // Aggregate totals
+        let agg_row: Option<Row> = conn
+            .exec_first(
+                r#"SELECT
+                       COALESCE(SUM(COALESCE(fare_final, fare_estimate)), 0)       AS gross_earnings,
+                       COALESCE(SUM(FLOOR(COALESCE(fare_final, fare_estimate) * 0.80)), 0) AS net_earnings,
+                       COALESCE(
+                           (SELECT SUM(r.tip_amount) FROM ratings r
+                            INNER JOIN orders o2 ON o2.id = r.order_id
+                            WHERE o2.driver_id = ?
+                              AND DATE(COALESCE(o2.completed_at, o2.cancelled_at)) BETWEEN ? AND ?
+                              AND r.target_id = ?), 0
+                       ) AS tips,
+                       COUNT(CASE WHEN status = 'completed' THEN 1 END)  AS trip_count,
+                       COUNT(CASE WHEN status = 'cancelled' THEN 1 END)  AS cancel_count,
+                       COALESCE(SUM(CASE WHEN status = 'completed' THEN distance_km ELSE 0 END), 0) AS distance_km
+                   FROM orders
+                   WHERE driver_id = ?
+                     AND DATE(COALESCE(completed_at, cancelled_at)) BETWEEN ? AND ?"#,
+                (driver_id, date_from, date_to, driver_id, driver_id, date_from, date_to),
+            )
+            .await?;
+
+        let (gross_earnings, net_earnings, tips, trip_count, cancel_count, distance_km) =
+            match agg_row {
+                Some(r) => (
+                    from_value::<i64>(col(&r, "gross_earnings")?),
+                    from_value::<i64>(col(&r, "net_earnings")?),
+                    from_value::<i64>(col(&r, "tips")?),
+                    from_value::<i32>(col(&r, "trip_count")?),
+                    from_value::<i32>(col(&r, "cancel_count")?),
+                    {
+                        let v: f64 = from_value(col(&r, "distance_km")?);
+                        v as f32
+                    },
+                ),
+                None => (0, 0, 0, 0, 0, 0.0),
+            };
+
+        // Online minutes dari driver_daily_summary (sum per hari)
+        let online_minutes: i64 = conn
+            .exec_first(
+                r#"SELECT COALESCE(SUM(online_minutes), 0)
+                   FROM driver_daily_summary
+                   WHERE driver_id = ? AND summary_date BETWEEN ? AND ?"#,
+                (driver_id, date_from, date_to),
+            )
+            .await?
+            .unwrap_or(0);
+
+        // Daily breakdown untuk grafik
+        let daily_rows: Vec<Row> = conn
+            .exec(
+                r#"SELECT
+                       DATE(COALESCE(completed_at, cancelled_at))        AS date,
+                       COALESCE(SUM(FLOOR(COALESCE(fare_final, fare_estimate) * 0.80)), 0) AS net_earnings,
+                       COUNT(CASE WHEN status = 'completed' THEN 1 END)  AS trip_count,
+                       COALESCE(SUM(CASE WHEN status = 'completed' THEN distance_km ELSE 0 END), 0) AS distance_km
+                   FROM orders
+                   WHERE driver_id = ?
+                     AND DATE(COALESCE(completed_at, cancelled_at)) BETWEEN ? AND ?
+                   GROUP BY DATE(COALESCE(completed_at, cancelled_at))
+                   ORDER BY DATE(COALESCE(completed_at, cancelled_at)) ASC"#,
+                (driver_id, date_from, date_to),
+            )
+            .await?;
+
+        let daily = daily_rows
+            .iter()
+            .map(|r| -> Result<DailyEarningRow> {
+                Ok(DailyEarningRow {
+                    date: {
+                        let v: mysql_async::Value = col(r, "date")?.clone();
+                        from_value::<String>(v)
+                    },
+                    net_earnings: from_value(col(r, "net_earnings")?),
+                    trip_count: from_value::<i64>(col(r, "trip_count")?) as i32,
+                    distance_km: {
+                        let v: f64 = from_value(col(r, "distance_km")?);
+                        v as f32
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(EarningsResult {
+            gross_earnings,
+            net_earnings,
+            tips,
+            trip_count,
+            cancel_count,
+            distance_km,
+            online_minutes,
+            daily,
+        })
     }
 }

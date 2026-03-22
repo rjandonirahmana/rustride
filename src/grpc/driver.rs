@@ -6,10 +6,10 @@ use crate::{
     auth::JwtService,
     grpc::trip::extract_token,
     proto::driver::{
-        driver_service_server::DriverService as DriverServiceGrpc,
-        DriverOrderDetail as ProtoDetail, DriverOrderItem as ProtoItem, GetOrderDetailReq,
-        GetOrderHistoryReq, GetTodayOrdersReq, GetTodaySummaryReq, OrderHistoryRes, TodayOrdersRes,
-        TodaySummaryRes,
+        driver_service_server::DriverService as DriverServiceGrpc, DailyEarning,
+        DriverOrderDetail as ProtoDetail, DriverOrderItem as ProtoItem, EarningsRes,
+        GetEarningsReq, GetOrderDetailReq, GetOrderHistoryReq, GetTodayOrdersReq,
+        GetTodaySummaryReq, OrderHistoryRes, TodayOrdersRes, TodaySummaryRes,
     },
     repository::driver::DriverRepository,
     service::driver::DriverService,
@@ -116,6 +116,58 @@ impl<DR: DriverRepository + 'static> DriverServiceGrpc for DriverServiceImpl<DR>
         Ok(Response::new(summary_to_proto(&summary)))
     }
 
+    // ── GetEarnings ───────────────────────────────────────────────────────────
+    async fn get_earnings(
+        &self,
+        req: Request<GetEarningsReq>,
+    ) -> Result<Response<EarningsRes>, Status> {
+        let claims = verify_driver(self, req.metadata())?;
+        let inner = req.into_inner();
+
+        // Resolusi tanggal berdasarkan period
+        let (date_from, date_to) = resolve_period(&inner.period, &inner.date_from, &inner.date_to)
+            .map_err(|e| Status::invalid_argument(e))?;
+
+        let result = self
+            .driver_svc
+            .get_earnings(&claims.sub, &date_from, &date_to)
+            .await
+            .map_err(|e| Status::internal(format!("EARNINGS_FAILED: {e}")))?;
+
+        let daily = result
+            .daily
+            .iter()
+            .map(|d| DailyEarning {
+                date: d.date.clone(),
+                net_earnings: d.net_earnings,
+                trip_count: d.trip_count,
+                distance_km: d.distance_km,
+            })
+            .collect();
+
+        let avg_per_trip = if result.trip_count > 0 {
+            result.net_earnings as f32 / result.trip_count as f32
+        } else {
+            0.0
+        };
+
+        Ok(Response::new(EarningsRes {
+            period: inner.period,
+            date_from,
+            date_to,
+            gross_earnings: result.gross_earnings,
+            net_earnings: result.net_earnings,
+            tips: result.tips,
+            platform_fee: result.gross_earnings - result.net_earnings,
+            trip_count: result.trip_count,
+            cancel_count: result.cancel_count,
+            avg_per_trip,
+            distance_km: result.distance_km,
+            online_hours: result.online_minutes as f32 / 60.0,
+            daily,
+        }))
+    }
+
     // ── GetOrderHistory ───────────────────────────────────────────────────────
     async fn get_order_history(
         &self,
@@ -138,6 +190,7 @@ impl<DR: DriverRepository + 'static> DriverServiceGrpc for DriverServiceImpl<DR>
                 (!inner.date_from.is_empty()).then_some(inner.date_from),
                 (!inner.date_to.is_empty()).then_some(inner.date_to),
                 (!inner.status.is_empty()).then_some(inner.status),
+                (!inner.service_type.is_empty()).then_some(inner.service_type),
                 page,
                 limit,
             )
@@ -184,7 +237,51 @@ impl<DR: DriverRepository + 'static> DriverServiceGrpc for DriverServiceImpl<DR>
             rider_phone: detail.rider_phone,
             rider_avatar: detail.rider_avatar,
             rider_rating: detail.rider_rating,
-            route: vec![], // route points opsional, isi kalau ada tabel terpisah
+            route: vec![],
         }))
+    }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Resolve (date_from, date_to) dari period string.
+/// Return Err jika period = "custom" tapi tanggal kosong.
+fn resolve_period(
+    period: &str,
+    date_from: &str,
+    date_to: &str,
+) -> Result<(String, String), String> {
+    use chrono::{Duration, Local};
+
+    let today = Local::now().date_naive();
+
+    match period {
+        "today" => {
+            let d = today.to_string();
+            Ok((d.clone(), d))
+        }
+        "week" => {
+            let from = (today - Duration::days(6)).to_string();
+            let to = today.to_string();
+            Ok((from, to))
+        }
+        "month" => {
+            let from = (today - Duration::days(29)).to_string();
+            let to = today.to_string();
+            Ok((from, to))
+        }
+        "custom" => {
+            if date_from.is_empty() || date_to.is_empty() {
+                Err("date_from dan date_to wajib diisi untuk period 'custom'".into())
+            } else {
+                Ok((date_from.to_string(), date_to.to_string()))
+            }
+        }
+        other => {
+            // Fallback: anggap hari ini
+            tracing::warn!("Unknown period '{}', defaulting to today", other);
+            let d = today.to_string();
+            Ok((d.clone(), d))
+        }
     }
 }
