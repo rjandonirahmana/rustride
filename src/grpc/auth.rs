@@ -7,7 +7,7 @@ use tonic::{Request, Response, Status};
 use crate::{
     auth::JwtService,
     models::user::RegisterRequest,
-    proto::ridehailing::{
+    proto::auth::{
         auth_service_server::AuthService, AuthResponse, LoginRequest,
         RegisterRequest as ProtoRegister,
     },

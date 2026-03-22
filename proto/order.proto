@@ -1,0 +1,94 @@
+syntax = "proto3";
+package order;
+
+service OrderService {
+  rpc CreateOrder(CreateOrderReq)            returns (OrderCreatedEvent);
+  rpc GetActiveOrder(Empty)  returns (ActiveOrderEvent);
+  rpc CancelOrder(CancelOrderReq)            returns (Empty);
+  rpc RateOrder(RateOrderReq)                returns (Empty);
+  rpc EstimateFare(EstimateFareReq)          returns (FareEstimateEvent);
+}
+
+message CreateOrderReq {
+  double pickup_lat     = 1;
+  double pickup_lng     = 2;
+  string pickup_address = 3;
+  double dest_lat       = 4;
+  double dest_lng       = 5;
+  string dest_address   = 6;
+  string service_type   = 7;
+}
+
+message Empty {}
+
+message CancelOrderReq {
+  string order_id = 1;
+  string reason   = 2;
+}
+
+message RateOrderReq {
+  string order_id = 1;
+  uint32 rating   = 2;
+  string comment  = 3;
+  double tip      = 4;
+}
+
+message EstimateFareReq {
+  double pickup_lat   = 1;
+  double pickup_lng   = 2;
+  double dest_lat     = 3;
+  double dest_lng     = 4;
+  string service_type = 5;
+}
+
+message OrderCreatedEvent {
+  string order_id      = 1;
+  int32  fare_estimate = 2;
+  string service_type  = 3;
+}
+
+message ActiveOrderEvent {
+  Order order = 1;
+}
+
+message FareEstimateEvent {
+  int32  fare_estimate = 1;
+  float  distance_km   = 2;
+  int32  duration_min  = 3;
+  string service_type  = 4;
+}
+
+message Order {
+  string     order_id       = 1;
+  string     rider_id       = 2;
+  string     driver_id      = 3;
+  string     status         = 4;
+  double     pickup_lat     = 5;
+  double     pickup_lng     = 6;
+  string     pickup_address = 7;
+  double     dest_lat       = 8;
+  double     dest_lng       = 9;
+  string     dest_address   = 10;
+  int32      fare_estimate  = 11;
+  string     service_type   = 12;
+  string     created_at     = 13;
+  DriverInfo driver         = 14;
+}
+
+message DriverInfo {
+  string user_id       = 1;
+  string name          = 2;
+  string phone         = 3;
+  string vehicle_plate = 4;
+  string vehicle_model = 5;
+  string vehicle_color = 6;
+  float  rating        = 7;
+}
+
+message DriverLocationMeta {
+  double lat     = 1;
+  double lng     = 2;
+  double heading = 3;
+  double speed   = 4;
+  int64  ts      = 5;
+}

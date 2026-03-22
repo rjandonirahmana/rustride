@@ -9,13 +9,20 @@ use crate::{
     connections::{ConnectionManager, Priority},
     location::LocationService,
     models::order::Order as ordermodels,
-    proto::ridehailing::{
-        app_service_server::AppService, client_event::Payload as Cp, server_event::Payload as Sp,
-        CallEndedEvent, ClientEvent, ConnectedEvent, CurrentOrder, DriverInfo, ErrorEvent,
-        GetUploadUrlRes, HistoryEvent, IceCandidateEvent, IncomingCallAnswer, IncomingCallOffer,
-        NearbyOrderItem, NearbyOrdersEvent, NearbyRideshareEvent, NewMessageEvent, Order,
-        OrderCreatedEvent, OrderStatusEvent, PongEvent, PresenceEvent, RideshareJoinedEvent,
-        RideshareOpenedEvent, SendMediaResponse, ServerEvent,
+    proto::{
+        message::{
+            ConversationItems, GetUploadUrlRes, HistoryEvent, NewMessageEvent, SendMediaResponse,
+        },
+        notification::NotificationsEvent,
+        order::{ActiveOrderEvent, DriverInfo, Order},
+        ridehailing::{
+            app_service_server::AppService, client_event::Payload as Cp,
+            server_event::Payload as Sp, CallEndedEvent, ClientEvent, ConnectedEvent,
+            DriverLocationEvent, ErrorEvent, IceCandidateEvent, IncomingCallAnswer,
+            IncomingCallOffer, NearbyDriverItem, NearbyDriversEvent, NearbyOrderItem,
+            NearbyOrdersEvent, NearbyRideshareEvent, OrderStatusEvent, PongEvent, PresenceEvent,
+            RideshareJoinedEvent, RideshareOpenedEvent, ServerEvent,
+        },
     },
     repository::{
         notification::NotificationRepositorytrait, order::OrderRepository,
@@ -76,7 +83,6 @@ where
         &self,
         request: Request<Streaming<ClientEvent>>,
     ) -> Result<Response<Self::StreamStream>, Status> {
-        // ── 1. Auth ───────────────────────────────────────────────────────────
         let token = extract_token(request.metadata())
             .ok_or_else(|| Status::unauthenticated("Missing Authorization header"))?;
 
@@ -89,18 +95,14 @@ where
         let role = claims.role.clone();
         let vehicle_type = claims.vehicle_type.clone();
 
-        // ── 2. Register channel server→client ─────────────────────────────────
-        // FIX: connect() sekarang return (Receiver, CancellationToken)
         let (event_rx, cancel_token) = self.connections.connect(&user_id, &role).await;
 
         if role == "driver" {
             let _ = self.user_repo.set_driver_active(&user_id, true).await;
-        } else if role == "rider" {
         }
 
         tracing::info!("userid {} connect {} {}", &user_id, &role, &vehicle_type);
 
-        // FIX: semua send() pakai Arc::new(event) + Priority
         self.connections.send(
             &user_id,
             Arc::new(ServerEvent {
@@ -143,18 +145,11 @@ where
                                     rating: profile.rating,
                                 }),
                                 Ok(None) => {
-                                    tracing::warn!(
-                                        driver_id = %driver_id,
-                                        "Driver not found in database"
-                                    );
+                                    tracing::warn!(driver_id = %driver_id, "Driver not found");
                                     None
                                 }
                                 Err(e) => {
-                                    tracing::error!(
-                                        driver_id = %driver_id,
-                                        error = %e,
-                                        "Failed to load driver info"
-                                    );
+                                    tracing::error!(driver_id = %driver_id, error = %e, "Failed to load driver info");
                                     None
                                 }
                             }
@@ -201,33 +196,36 @@ where
                 }
             });
         } else {
+            // driver reconnect
             let order_svc = self.order_svc.clone();
             let connections2 = self.connections.clone();
+            let user_repo2 = self.user_repo.clone();
             let uid2 = user_id.clone();
 
             tokio::spawn(async move {
                 match order_svc.get_active_order_for_driver(&uid2).await {
                     Ok(Some(o)) => {
+                        let mut proto_order = order_to_proto(&o);
+                        if let Some(ref driver_id) = o.driver_id {
+                            if let Ok(Some((user, profile))) =
+                                user_repo2.find_driver_by_id(driver_id).await
+                            {
+                                proto_order.driver = Some(DriverInfo {
+                                    user_id: driver_id.clone(),
+                                    name: user.name,
+                                    phone: user.phone,
+                                    vehicle_plate: profile.vehicle_plate,
+                                    vehicle_model: profile.vehicle_model,
+                                    vehicle_color: profile.vehicle_color,
+                                    rating: profile.rating,
+                                });
+                            }
+                        }
                         connections2.send(
                             &uid2,
                             Arc::new(ServerEvent {
-                                payload: Some(Sp::CurrentOrder(CurrentOrder {
-                                    order: Some(Order {
-                                        id: o.id,
-                                        rider_id: o.rider_id,
-                                        driver_id: uid2.to_string(),
-                                        status: o.status,
-                                        pickup_address: o.pickup_address,
-                                        pickup_lat: o.pickup_lat,
-                                        pickup_lng: o.pickup_lng,
-                                        dest_address: o.dest_address,
-                                        dest_lat: o.dest_lat,
-                                        dest_lng: o.dest_lng,
-                                        fare_estimate: o.fare_estimate,
-                                        service_type: o.service_type,
-                                        created_at: o.created_at,
-                                        rider_name: o.rider_name,
-                                    }),
+                                payload: Some(Sp::CurrentOrder(ActiveOrderEvent {
+                                    order: Some(proto_order),
                                 })),
                             }),
                             Priority::Critical,
@@ -241,7 +239,6 @@ where
             });
         }
 
-        // ── 3. Spawn reader task — client → server ────────────────────────────
         let order_svc = self.order_svc.clone();
         let connections = self.connections.clone();
         let user_repo = self.user_repo.clone();
@@ -280,7 +277,6 @@ where
             }
 
             tracing::info!(user_id = %uid, "gRPC stream closed");
-            // FIX: disconnect() sekarang butuh cancel_token
             connections.disconnect(&uid, cancel_token).await;
 
             if role_r == "rider" {
@@ -307,8 +303,6 @@ where
     }
 }
 
-// ── Event dispatcher ──────────────────────────────────────────────────────────
-
 async fn dispatch<OR, UR, RR, NR>(
     event: ClientEvent,
     user_id: &str,
@@ -333,26 +327,21 @@ async fn dispatch<OR, UR, RR, NR>(
     };
 
     match payload {
-        Cp::GetMessageReq(_) => match chat_svc.get_conversations(user_id).await {
-            Ok(data) => {
-                connections.send(
-                    user_id,
-                    Arc::new(ServerEvent {
-                        payload: Some(Sp::ConversationItems(
-                            crate::proto::ridehailing::ConversationItems { items: data },
-                        )),
-                    }),
-                    Priority::Normal,
-                );
-            }
-            Err(e) => {
-                connections.send(
-                    user_id,
-                    err_event("FIND_MESSAGE_ERROR", &e.to_string()),
-                    Priority::Normal,
-                );
-            }
-        },
+        // ── Get conversations ─────────────────────────────────────────────────
+        // Cp::GetConversations(_) => match chat_svc.get_conversations(user_id).await {
+        //     Ok(data) => connections.send(
+        //         user_id,
+        //         Arc::new(ServerEvent {
+        //             payload: Some(Sp::ConversationItems(ConversationItems { items: data })),
+        //         }),
+        //         Priority::Normal,
+        //     ),
+        //     Err(e) => connections.send(
+        //         user_id,
+        //         err_event("FIND_MESSAGE_ERROR", &e.to_string()),
+        //         Priority::Normal,
+        //     ),
+        // },
 
         // ── Rider: watch driver aktif di sekitar ──────────────────────────────
         Cp::WatchDrivers(req) => {
@@ -364,7 +353,6 @@ async fn dispatch<OR, UR, RR, NR>(
                 );
                 return;
             }
-
             match location
                 .find_nearby_drivers(req.lat, req.lng, &req.service_type)
                 .await
@@ -373,7 +361,7 @@ async fn dispatch<OR, UR, RR, NR>(
                     let mut items = vec![];
                     for (driver_id, dist_m) in drivers.iter() {
                         if let Ok(Some(loc)) = location.get_driver_location(driver_id).await {
-                            items.push(crate::proto::ridehailing::NearbyDriverItem {
+                            items.push(NearbyDriverItem {
                                 driver_id: driver_id.clone(),
                                 lat: loc.lat,
                                 lng: loc.lng,
@@ -385,60 +373,14 @@ async fn dispatch<OR, UR, RR, NR>(
                     connections.send(
                         user_id,
                         Arc::new(ServerEvent {
-                            payload: Some(Sp::NearbyDrivers(
-                                crate::proto::ridehailing::NearbyDriversEvent { drivers: items },
-                            )),
+                            payload: Some(Sp::NearbyDrivers(NearbyDriversEvent { drivers: items })),
                         }),
                         Priority::Normal,
                     );
                 }
-                Err(e) => {
-                    connections.send(
-                        user_id,
-                        err_event("FIND_FAILED", &e.to_string()),
-                        Priority::Normal,
-                    );
-                }
-            }
-        }
-
-        // ── Rider: buat order ─────────────────────────────────────────────────
-        Cp::CreateOrder(c) => {
-            if role != "rider" {
-                connections.send(
-                    user_id,
-                    err_event("FORBIDDEN", "Hanya rider"),
-                    Priority::Normal,
-                );
-                return;
-            }
-            match order_svc
-                .create_order(
-                    user_id,
-                    c.pickup_lat,
-                    c.pickup_lng,
-                    c.pickup_address,
-                    c.dest_lat,
-                    c.dest_lng,
-                    c.dest_address,
-                    &c.service_type,
-                )
-                .await
-            {
-                Ok(order) => connections.send(
-                    user_id,
-                    Arc::new(ServerEvent {
-                        payload: Some(Sp::OrderCreated(OrderCreatedEvent {
-                            order_id: order.id,
-                            fare_estimate: order.fare_estimate,
-                            service_type: order.service_type,
-                        })),
-                    }),
-                    Priority::Critical,
-                ),
                 Err(e) => connections.send(
                     user_id,
-                    err_event("CREATE_FAILED", &e.to_string()),
+                    err_event("FIND_FAILED", &e.to_string()),
                     Priority::Normal,
                 ),
             }
@@ -454,7 +396,6 @@ async fn dispatch<OR, UR, RR, NR>(
                 );
                 return;
             }
-
             if let Err(e) = location
                 .update_driver_location(
                     user_id,
@@ -473,32 +414,26 @@ async fn dispatch<OR, UR, RR, NR>(
                 );
                 return;
             }
-
             match order_svc.get_active_order_for_driver(user_id).await {
                 Ok(Some(order)) => {
                     connections.send(
                         &order.rider_id,
                         Arc::new(ServerEvent {
-                            payload: Some(Sp::DriverLoc(
-                                crate::proto::ridehailing::DriverLocationEvent {
-                                    lat: loc.lat,
-                                    lng: loc.lng,
-                                    heading: loc.heading,
-                                    order_id: order.id,
-                                },
-                            )),
+                            payload: Some(Sp::DriverLoc(DriverLocationEvent {
+                                lat: loc.lat,
+                                lng: loc.lng,
+                                heading: loc.heading,
+                                order_id: order.id,
+                            })),
                         }),
-                        // Location update ke rider saat trip aktif = Normal priority
                         Priority::Normal,
                     );
                 }
-                Err(e) => {
-                    connections.send(
-                        user_id,
-                        err_event("LOC_UPDATE_FAILED", &e.to_string()),
-                        Priority::Normal,
-                    );
-                }
+                Err(e) => connections.send(
+                    user_id,
+                    err_event("LOC_UPDATE_FAILED", &e.to_string()),
+                    Priority::Normal,
+                ),
                 Ok(None) => {}
             }
         }
@@ -513,15 +448,14 @@ async fn dispatch<OR, UR, RR, NR>(
                 );
                 return;
             }
-
             match order_svc.get_active_order_for_driver(user_id).await {
                 Ok(Some(o)) => {
                     connections.send(
                         user_id,
                         Arc::new(ServerEvent {
-                            payload: Some(Sp::CurrentOrder(CurrentOrder {
+                            payload: Some(Sp::CurrentOrder(ActiveOrderEvent {
                                 order: Some(Order {
-                                    id: o.id,
+                                    order_id: o.id,
                                     rider_id: o.rider_id,
                                     driver_id: user_id.to_string(),
                                     status: o.status,
@@ -534,7 +468,7 @@ async fn dispatch<OR, UR, RR, NR>(
                                     fare_estimate: o.fare_estimate,
                                     service_type: o.service_type,
                                     created_at: o.created_at,
-                                    rider_name: o.rider_name,
+                                    driver: None,
                                 }),
                             })),
                         }),
@@ -568,22 +502,18 @@ async fn dispatch<OR, UR, RR, NR>(
                                 Priority::Normal,
                             );
                         }
-                        Err(e) => {
-                            connections.send(
-                                user_id,
-                                err_event("BROWSE_FAILED", &e.to_string()),
-                                Priority::Normal,
-                            );
-                        }
+                        Err(e) => connections.send(
+                            user_id,
+                            err_event("BROWSE_FAILED", &e.to_string()),
+                            Priority::Normal,
+                        ),
                     }
                 }
-                Err(e) => {
-                    connections.send(
-                        user_id,
-                        err_event("BROWSE_FAILED", &e.to_string()),
-                        Priority::Normal,
-                    );
-                }
+                Err(e) => connections.send(
+                    user_id,
+                    err_event("BROWSE_FAILED", &e.to_string()),
+                    Priority::Normal,
+                ),
             }
         }
 
@@ -683,246 +613,166 @@ async fn dispatch<OR, UR, RR, NR>(
         }
 
         // ── Send message ──────────────────────────────────────────────────────
-        Cp::SendMessage(m) => {
-            if m.content.trim().is_empty() {
-                connections.send(
-                    user_id,
-                    err_event("EMPTY_CONTENT", "Pesan tidak boleh kosong"),
-                    Priority::Normal,
-                );
-                return;
-            }
+        // Cp::SendMessage(m) => {
+        //     if m.content.trim().is_empty() {
+        //         connections.send(
+        //             user_id,
+        //             err_event("EMPTY_CONTENT", "Pesan tidak boleh kosong"),
+        //             Priority::Normal,
+        //         );
+        //         return;
+        //     }
+        //     let (order, peer_id) =
+        //         match resolve_peer(user_id, role, &m.order_id, order_svc, connections).await {
+        //             Some(v) => v,
+        //             None => return,
+        //         };
+        //     if m.recipient_id != peer_id {
+        //         connections.send(
+        //             user_id,
+        //             err_event("INVALID_RECIPIENT", "Tidak bisa chat dengan person ini"),
+        //             Priority::Normal,
+        //         );
+        //         return;
+        //     }
+        //     if !is_order_active(&order.status) {
+        //         connections.send(
+        //             user_id,
+        //             err_event(
+        //                 "INACTIVE_ORDER",
+        //                 "Chat hanya tersedia saat order berlangsung",
+        //             ),
+        //             Priority::Normal,
+        //         );
+        //         return;
+        //     }
+        //     if let Err(e) = chat_svc
+        //         .send_text(user_id, &peer_id, &m.content, username, &order.id)
+        //         .await
+        //     {
+        //         tracing::error!(error = %e, "send_text failed");
+        //         connections.send(
+        //             user_id,
+        //             err_event("SEND_FAILED", &e.to_string()),
+        //             Priority::Normal,
+        //         );
+        //     }
+        // }
 
-            let order = match order_svc.order_repo.find_by_id(&m.order_id).await {
-                Ok(Some(o)) => o,
-                Ok(None) => {
-                    connections.send(
-                        user_id,
-                        err_event("ORDER_NOT_FOUND", "Order tidak ditemukan"),
-                        Priority::Normal,
-                    );
-                    return;
-                }
-                Err(e) => {
-                    connections.send(
-                        user_id,
-                        err_event("DB_ERROR", &e.to_string()),
-                        Priority::Normal,
-                    );
-                    return;
-                }
-            };
+        // // ── Get upload URL ────────────────────────────────────────────────────
+        // Cp::GetUploadUrl(req) => match chat_svc.get_upload_url(user_id, &req.mime).await {
+        //     Ok((upload_url, public_url)) => connections.send(
+        //         user_id,
+        //         Arc::new(ServerEvent {
+        //             payload: Some(Sp::UploadUrlRes(GetUploadUrlRes {
+        //                 upload_url,
+        //                 public_url,
+        //             })),
+        //         }),
+        //         Priority::Normal,
+        //     ),
+        //     Err(e) => connections.send(
+        //         user_id,
+        //         err_event("GET_UPLOAD_URL_ERROR", &e.to_string()),
+        //         Priority::Normal,
+        //     ),
+        // },
 
-            let peer_id = match get_peer_id(role, &order, user_id) {
-                Ok(p) => p,
-                Err(e) => {
-                    connections.send(
-                        user_id,
-                        err_event("INVALID_ORDER", &e.to_string()),
-                        Priority::Normal,
-                    );
-                    return;
-                }
-            };
+        // // ── Kirim media ───────────────────────────────────────────────────────
+        // Cp::SendMedia(m) => {
+        //     if m.media_url.is_empty() {
+        //         connections.send(
+        //             user_id,
+        //             err_event("MISSING_URL", "media_url tidak boleh kosong"),
+        //             Priority::Normal,
+        //         );
+        //         return;
+        //     }
+        //     if !m
+        //         .media_url
+        //         .starts_with("http://vmi3152926.contaboserver.net/rustride/")
+        //     {
+        //         connections.send(
+        //             user_id,
+        //             err_event("INVALID_URL", "URL tidak valid"),
+        //             Priority::Normal,
+        //         );
+        //         return;
+        //     }
+        //     if !m.media_mime.starts_with("image/")
+        //         && !m.media_mime.starts_with("video/")
+        //         && !m.media_mime.starts_with("audio/")
+        //     {
+        //         connections.send(
+        //             user_id,
+        //             err_event("INVALID_MIME", "Tipe file tidak didukung"),
+        //             Priority::Normal,
+        //         );
+        //         return;
+        //     }
+        //     let (order, peer_id) =
+        //         match resolve_peer(user_id, role, &m.order_id, order_svc, connections).await {
+        //             Some(v) => v,
+        //             None => return,
+        //         };
+        //     if m.recipient_id != peer_id {
+        //         connections.send(
+        //             user_id,
+        //             err_event("INVALID_RECIPIENT", "Tidak bisa chat dengan person ini"),
+        //             Priority::Normal,
+        //         );
+        //         return;
+        //     }
+        //     if !is_order_active(&order.status) {
+        //         connections.send(
+        //             user_id,
+        //             err_event(
+        //                 "INACTIVE_ORDER",
+        //                 "Chat hanya tersedia saat order berlangsung",
+        //             ),
+        //             Priority::Normal,
+        //         );
+        //         return;
+        //     }
+        //     match chat_svc
+        //         .send_media(
+        //             user_id,
+        //             &peer_id,
+        //             &m.media_url,
+        //             &m.media_mime,
+        //             m.media_size,
+        //             username,
+        //             &m.order_id,
+        //         )
+        //         .await
+        //     {
+        //         Ok(d) => connections.send(
+        //             user_id,
+        //             Arc::new(ServerEvent {
+        //                 payload: Some(Sp::SendMediaRes(SendMediaResponse {
+        //                     client_msg_id: m.client_msg_id,
+        //                     msg_id: d.id,
+        //                 })),
+        //             }),
+        //             Priority::Normal,
+        //         ),
+        //         Err(e) => {
+        //             tracing::error!(error = %e, "send_media failed");
+        //             connections.send(
+        //                 user_id,
+        //                 err_event("SEND_FAILED", &e.to_string()),
+        //                 Priority::Normal,
+        //             );
+        //         }
+        //     }
+        // }
 
-            if m.recipient_id != peer_id {
-                tracing::warn!(
-                    user_id = %user_id,
-                    recipient = %m.recipient_id,
-                    expected = %peer_id,
-                    "Recipient mismatch"
-                );
-                connections.send(
-                    user_id,
-                    err_event("INVALID_RECIPIENT", "Tidak bisa chat dengan person ini"),
-                    Priority::Normal,
-                );
-                return;
-            }
-
-            if !is_order_active(&order.status) {
-                connections.send(
-                    user_id,
-                    err_event(
-                        "INACTIVE_ORDER",
-                        "Chat hanya tersedia saat order berlangsung",
-                    ),
-                    Priority::Normal,
-                );
-                return;
-            }
-
-            if let Err(e) = chat_svc
-                .send_text(user_id, &peer_id, &m.content, username, &order.id)
-                .await
-            {
-                tracing::error!(error = %e, "send_text failed");
-                connections.send(
-                    user_id,
-                    err_event("SEND_FAILED", &e.to_string()),
-                    Priority::Normal,
-                );
-            }
-        }
-
-        // ── Get upload URL ────────────────────────────────────────────────────
-        Cp::GetUploadUrl(req) => match chat_svc.get_upload_url(user_id, &req.mime).await {
-            Ok(d) => {
-                connections.send(
-                    user_id,
-                    Arc::new(ServerEvent {
-                        payload: Some(Sp::UploadUrlRes(GetUploadUrlRes {
-                            upload_url: d.0,
-                            public_url: d.1,
-                        })),
-                    }),
-                    Priority::Normal,
-                );
-            }
-            Err(e) => {
-                connections.send(
-                    user_id,
-                    err_event("GET_UPLOAD_URL_ERROR", &e.to_string()),
-                    Priority::Normal,
-                );
-            }
-        },
-
-        // ── Kirim media ───────────────────────────────────────────────────────
-        Cp::SendMedia(m) => {
-            if m.media_url.is_empty() {
-                connections.send(
-                    user_id,
-                    err_event("MISSING_URL", "media_url tidak boleh kosong"),
-                    Priority::Normal,
-                );
-                return;
-            }
-
-            if !m
-                .media_url
-                .starts_with("http://vmi3152926.contaboserver.net/rustride/")
-            {
-                connections.send(
-                    user_id,
-                    err_event("INVALID_URL", "URL tidak valid"),
-                    Priority::Normal,
-                );
-                return;
-            }
-
-            if !m.media_mime.starts_with("image/")
-                && !m.media_mime.starts_with("video/")
-                && !m.media_mime.starts_with("audio/")
-            {
-                connections.send(
-                    user_id,
-                    err_event("INVALID_MIME", "Tipe file tidak didukung"),
-                    Priority::Normal,
-                );
-                return;
-            }
-
-            let order = match order_svc.order_repo.find_by_id(&m.order_id).await {
-                Ok(Some(o)) => o,
-                Ok(None) => {
-                    connections.send(
-                        user_id,
-                        err_event("ORDER_NOT_FOUND", "Order tidak ditemukan"),
-                        Priority::Normal,
-                    );
-                    return;
-                }
-                Err(e) => {
-                    connections.send(
-                        user_id,
-                        err_event("DB_ERROR", &e.to_string()),
-                        Priority::Normal,
-                    );
-                    return;
-                }
-            };
-
-            let peer_id = match get_peer_id(role, &order, user_id) {
-                Ok(p) => p,
-                Err(e) => {
-                    connections.send(
-                        user_id,
-                        err_event("INVALID_ORDER", &e.to_string()),
-                        Priority::Normal,
-                    );
-                    return;
-                }
-            };
-
-            if m.recipient_id != peer_id {
-                tracing::warn!(
-                    user_id = %user_id,
-                    recipient = %m.recipient_id,
-                    expected = %peer_id,
-                    "Recipient mismatch in SendMedia"
-                );
-                connections.send(
-                    user_id,
-                    err_event("INVALID_RECIPIENT", "Tidak bisa chat dengan person ini"),
-                    Priority::Normal,
-                );
-                return;
-            }
-
-            if !is_order_active(&order.status) {
-                connections.send(
-                    user_id,
-                    err_event(
-                        "INACTIVE_ORDER",
-                        "Chat hanya tersedia saat order berlangsung",
-                    ),
-                    Priority::Normal,
-                );
-                return;
-            }
-
-            match chat_svc
-                .send_media(
-                    user_id,
-                    &peer_id,
-                    &m.media_url,
-                    &m.media_mime,
-                    m.media_size,
-                    username,
-                    &m.order_id,
-                )
-                .await
-            {
-                Err(e) => {
-                    tracing::error!(error = %e, "send_media failed");
-                    connections.send(
-                        user_id,
-                        err_event("SEND_FAILED", &e.to_string()),
-                        Priority::Normal,
-                    );
-                }
-                Ok(d) => {
-                    connections.send(
-                        user_id,
-                        Arc::new(ServerEvent {
-                            payload: Some(Sp::SendMediaResponse(SendMediaResponse {
-                                client_msg_id: m.client_msg_id,
-                                msg_id: d.id,
-                            })),
-                        }),
-                        Priority::Normal,
-                    );
-                }
-            }
-        }
-
-        // ── Mark read ─────────────────────────────────────────────────────────
-        Cp::MarkRead(r) => {
-            if let Err(e) = chat_svc.mark_read(user_id, &r.from_user_id).await {
-                tracing::error!(error = %e, "mark_read failed");
-            }
-        }
+        // // ── Mark read ─────────────────────────────────────────────────────────
+        // Cp::MarkRead(r) => {
+        //     if let Err(e) = chat_svc.mark_read(user_id, &r.from_user_id).await {
+        //         tracing::error!(error = %e, "mark_read failed");
+        //     }
+        // }
 
         // ── Watch user presence ───────────────────────────────────────────────
         Cp::WatchUser(w) => {
@@ -941,76 +791,51 @@ async fn dispatch<OR, UR, RR, NR>(
         }
 
         // ── Get history ───────────────────────────────────────────────────────
-        Cp::GetHistory(h) => {
-            let before = (!h.before.is_empty()).then_some(h.before.as_str());
-            match chat_svc
-                .get_history(user_id, &h.peer_id, h.limit, before)
-                .await
-            {
-                Ok(msgs) => {
-                    let has_more = msgs.len() as i32 == h.limit;
-                    let items = msgs
-                        .iter()
-                        .map(|m| NewMessageEvent {
-                            msg_id: m.id.clone(),
-                            sender_id: m.sender_id.clone(),
-                            sender_name: m.sender_name.clone().unwrap(),
-                            recipient_id: m.recipient_id.clone(),
-                            content: m.content.clone(),
-                            msg_type: m.msg_type.clone(),
-                            sent_at: m.sent_at.clone(),
-                            media_url: m.media_url.clone().unwrap_or_default(),
-                            media_mime: m.media_mime.clone().unwrap_or_default(),
-                            media_size: m.media_size.unwrap_or(0),
-                            media_duration: m.media_duration.unwrap_or(0),
-                            media_thumb: m.media_thumb.clone().unwrap_or_default(),
-                            sender_avatar: m.sender_avatar.clone().unwrap_or_default(),
-                            status_order: m.status_order.clone().unwrap_or_default(),
-                        })
-                        .collect();
-                    connections.send(
-                        user_id,
-                        Arc::new(ServerEvent {
-                            payload: Some(Sp::History(HistoryEvent {
-                                messages: items,
-                                has_more,
-                            })),
-                        }),
-                        Priority::Normal,
-                    );
-                }
-                Err(e) => connections.send(
-                    user_id,
-                    err_event("HISTORY_FAILED", &e.to_string()),
-                    Priority::Normal,
-                ),
-            }
-        }
-
-        // ── Get active order ──────────────────────────────────────────────────
-        Cp::GetActiveOrder(_) => match order_svc.get_active_order_for_user(user_id).await {
-            Ok(Some(order)) => {
-                connections.send(
-                    user_id,
-                    Arc::new(ServerEvent {
-                        payload: Some(Sp::OrderCreated(
-                            crate::proto::ridehailing::OrderCreatedEvent {
-                                order_id: order.id,
-                                fare_estimate: order.fare_estimate,
-                                service_type: order.service_type,
-                            },
-                        )),
-                    }),
-                    Priority::Critical,
-                );
-            }
-            Ok(None) => {}
-            Err(e) => connections.send(
-                user_id,
-                err_event("ACTIVE_ORDER_FAILED", &e.to_string()),
-                Priority::Normal,
-            ),
-        },
+        // Cp::GetHistory(h) => {
+        //     let before = (!h.before.is_empty()).then_some(h.before.as_str());
+        //     match chat_svc
+        //         .get_history(user_id, &h.peer_id, h.limit, before)
+        //         .await
+        //     {
+        //         Ok(msgs) => {
+        //             let has_more = msgs.len() as i32 == h.limit;
+        //             let items = msgs
+        //                 .into_iter()
+        //                 .map(|m| NewMessageEvent {
+        //                     msg_id: m.id,
+        //                     sender_id: m.sender_id,
+        //                     sender_name: m.sender_name.unwrap_or_default(), // FIX: no panic
+        //                     recipient_id: m.recipient_id,
+        //                     content: m.content,
+        //                     msg_type: m.msg_type,
+        //                     sent_at: m.sent_at,
+        //                     media_url: m.media_url.unwrap_or_default(),
+        //                     media_mime: m.media_mime.unwrap_or_default(),
+        //                     media_size: m.media_size.unwrap_or(0),
+        //                     media_duration: m.media_duration.unwrap_or(0),
+        //                     media_thumb: m.media_thumb.unwrap_or_default(),
+        //                     sender_avatar: m.sender_avatar.unwrap_or_default(),
+        //                     status_order: m.status_order.unwrap_or_default(),
+        //                 })
+        //                 .collect();
+        //             connections.send(
+        //                 user_id,
+        //                 Arc::new(ServerEvent {
+        //                     payload: Some(Sp::History(HistoryEvent {
+        //                         messages: items,
+        //                         has_more,
+        //                     })),
+        //                 }),
+        //                 Priority::Normal,
+        //             );
+        //         }
+        //         Err(e) => connections.send(
+        //             user_id,
+        //             err_event("HISTORY_FAILED", &e.to_string()),
+        //             Priority::Normal,
+        //         ),
+        //     }
+        // }
 
         // ── Estimate fare ─────────────────────────────────────────────────────
         Cp::EstimateFare(req) => {
@@ -1024,15 +849,13 @@ async fn dispatch<OR, UR, RR, NR>(
                 )
                 .await
             {
-                Ok(fare) => {
-                    connections.send(
-                        user_id,
-                        Arc::new(ServerEvent {
-                            payload: Some(Sp::FareEstimate(fare)),
-                        }),
-                        Priority::Normal,
-                    );
-                }
+                Ok(fare) => connections.send(
+                    user_id,
+                    Arc::new(ServerEvent {
+                        payload: Some(Sp::FareEstimate(fare)),
+                    }),
+                    Priority::Normal,
+                ),
                 Err(e) => connections.send(
                     user_id,
                     err_event("ESTIMATE_FAILED", &e.to_string()),
@@ -1072,7 +895,6 @@ async fn dispatch<OR, UR, RR, NR>(
                 );
                 return;
             }
-
             let order = match order_svc.order_repo.find_active_for_driver(user_id).await {
                 Ok(Some(o)) => o,
                 Ok(None) => {
@@ -1092,14 +914,12 @@ async fn dispatch<OR, UR, RR, NR>(
                     return;
                 }
             };
-
             let deadline = (req.join_deadline_s > 0).then_some(req.join_deadline_s as i64);
             let max = if req.max_passengers > 0 {
                 req.max_passengers
             } else {
                 3
             };
-
             match rideshare_svc
                 .open_trip(
                     user_id,
@@ -1143,13 +963,11 @@ async fn dispatch<OR, UR, RR, NR>(
                 );
                 return;
             }
-
             let radius = if req.radius_km > 0.0 {
                 req.radius_km as f64
             } else {
                 5.0
             };
-
             match rideshare_svc
                 .browse_trips(
                     req.pickup_lat,
@@ -1186,7 +1004,6 @@ async fn dispatch<OR, UR, RR, NR>(
                 );
                 return;
             }
-
             let avatar = order_svc
                 .user_repo
                 .find_by_id(user_id)
@@ -1195,7 +1012,6 @@ async fn dispatch<OR, UR, RR, NR>(
                 .flatten()
                 .and_then(|u| u.avatar_url)
                 .unwrap_or_default();
-
             match rideshare_svc
                 .join_trip(
                     user_id,
@@ -1218,7 +1034,7 @@ async fn dispatch<OR, UR, RR, NR>(
                             passenger_id,
                             trip_id: req.trip_id,
                             fare_estimate: fare,
-                            status: "pending".to_string(),
+                            status: "pending".into(),
                         })),
                     }),
                     Priority::Critical,
@@ -1298,7 +1114,7 @@ async fn dispatch<OR, UR, RR, NR>(
             }
         }
 
-        // ── Driver: antar penumpang ke tujuan ─────────────────────────────────
+        // ── Driver: antar penumpang ───────────────────────────────────────────
         Cp::DropPassenger(req) => {
             if role != "driver" {
                 connections.send(
@@ -1341,84 +1157,50 @@ async fn dispatch<OR, UR, RR, NR>(
         }
 
         // ── Ambil notifikasi ──────────────────────────────────────────────────
-        Cp::GetNotifications(req) => {
-            let limit = if req.limit > 0 { req.limit } else { 20 };
-            let before = (req.before > 0).then_some(req.before);
+        // Cp::GetNotifications(req) => {
+        //     let limit = if req.limit > 0 { req.limit } else { 20 };
+        //     let before = (req.before > 0).then_some(req.before);
+        //     match notif_svc
+        //         .list(user_id, limit, before, req.unread_only)
+        //         .await
+        //     {
+        //         Ok(event) => connections.send(
+        //             user_id,
+        //             Arc::new(ServerEvent {
+        //                 payload: Some(Sp::Notifications(event)),
+        //             }),
+        //             Priority::Normal,
+        //         ),
+        //         Err(e) => connections.send(
+        //             user_id,
+        //             err_event("NOTIF_FAILED", &e.to_string()),
+        //             Priority::Normal,
+        //         ),
+        //     }
+        // }
 
-            match notif_svc
-                .list(user_id, limit, before, req.unread_only)
-                .await
-            {
-                Ok(event) => connections.send(
-                    user_id,
-                    Arc::new(ServerEvent {
-                        payload: Some(Sp::Notifications(event)),
-                    }),
-                    Priority::Normal,
-                ),
-                Err(e) => connections.send(
-                    user_id,
-                    err_event("NOTIF_FAILED", &e.to_string()),
-                    Priority::Normal,
-                ),
-            }
-        }
+        // // ── Tandai notif sudah dibaca ─────────────────────────────────────────
+        // Cp::MarkNotifRead(req) => {
+        //     if let Err(e) = notif_svc.mark_read(req.notif_id, user_id).await {
+        //         tracing::error!(error = %e, "mark_notif_read failed");
+        //     }
+        // }
 
-        // ── Tandai notif sudah dibaca ─────────────────────────────────────────
-        Cp::MarkNotifRead(req) => {
-            if let Err(e) = notif_svc.mark_read(req.notif_id, user_id).await {
-                tracing::error!(error = %e, "mark_notif_read failed");
-            }
-        }
-
-        // ── Tandai semua notif sudah dibaca ──────────────────────────────────
-        Cp::MarkAllNotifRead(_) => {
-            if let Err(e) = notif_svc.mark_all_read(user_id).await {
-                tracing::error!(error = %e, "mark_all_notif_read failed");
-            }
-        }
+        // // ── Tandai semua notif sudah dibaca ──────────────────────────────────
+        // Cp::MarkAllNotifRead(_) => {
+        //     if let Err(e) = notif_svc.mark_all_read(user_id).await {
+        //         tracing::error!(error = %e, "mark_all_notif_read failed");
+        //     }
+        // }
 
         // ── WebRTC: call offer ────────────────────────────────────────────────
         Cp::CallOffer(c) => {
-            let order = match order_svc.order_repo.find_by_id(&c.order_id).await {
-                Ok(Some(o)) => o,
-                Ok(None) => {
-                    connections.send(
-                        user_id,
-                        err_event("ORDER_NOT_FOUND", "Order tidak ditemukan"),
-                        Priority::Normal,
-                    );
-                    return;
-                }
-                Err(e) => {
-                    connections.send(
-                        user_id,
-                        err_event("DB_ERROR", &e.to_string()),
-                        Priority::Normal,
-                    );
-                    return;
-                }
-            };
-
-            let peer_id = match get_peer_id(role, &order, user_id) {
-                Ok(p) => p,
-                Err(e) => {
-                    connections.send(
-                        user_id,
-                        err_event("INVALID_ORDER", &e.to_string()),
-                        Priority::Normal,
-                    );
-                    return;
-                }
-            };
-
+            let (order, peer_id) =
+                match resolve_peer(user_id, role, &c.order_id, order_svc, connections).await {
+                    Some(v) => v,
+                    None => return,
+                };
             if c.target_user_id != peer_id {
-                tracing::warn!(
-                    caller = %user_id,
-                    target = %c.target_user_id,
-                    expected = %peer_id,
-                    "Call target mismatch"
-                );
                 connections.send(
                     user_id,
                     err_event("INVALID_TARGET", "Tidak bisa call person ini"),
@@ -1426,7 +1208,6 @@ async fn dispatch<OR, UR, RR, NR>(
                 );
                 return;
             }
-
             if !is_order_active(&order.status) {
                 connections.send(
                     user_id,
@@ -1438,13 +1219,11 @@ async fn dispatch<OR, UR, RR, NR>(
                 );
                 return;
             }
-
             tracing::info!(caller = %user_id, callee = %peer_id, order_id = %c.order_id, "Call offer initiated");
-
             connections.send(
                 &peer_id,
                 Arc::new(ServerEvent {
-                    payload: Some(Sp::IncomingCallOffer(IncomingCallOffer {
+                    payload: Some(Sp::IncomingCall(IncomingCallOffer {
                         caller_id: user_id.to_string(),
                         sdp: c.sdp,
                     })),
@@ -1458,7 +1237,7 @@ async fn dispatch<OR, UR, RR, NR>(
             connections.send(
                 &a.caller_id,
                 Arc::new(ServerEvent {
-                    payload: Some(Sp::IncomingCallAnswer(IncomingCallAnswer {
+                    payload: Some(Sp::CallAnswer(IncomingCallAnswer {
                         callee_id: user_id.to_string(),
                         sdp: a.sdp,
                     })),
@@ -1472,7 +1251,7 @@ async fn dispatch<OR, UR, RR, NR>(
             connections.send(
                 &i.peer_id,
                 Arc::new(ServerEvent {
-                    payload: Some(Sp::IceCandidateEvent(IceCandidateEvent {
+                    payload: Some(Sp::IceCandidate(IceCandidateEvent {
                         peer_id: user_id.to_string(),
                         candidate: i.candidate,
                     })),
@@ -1497,6 +1276,52 @@ async fn dispatch<OR, UR, RR, NR>(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Resolve order + peer_id sekaligus, kirim error ke client jika gagal.
+/// Return None = caller harus `return` segera.
+async fn resolve_peer<OR, UR>(
+    user_id: &str,
+    role: &str,
+    order_id: &str,
+    order_svc: &Arc<OrderService<OR, UR>>,
+    connections: &Arc<ConnectionManager>,
+) -> Option<(ordermodels, String)>
+where
+    OR: OrderRepository + 'static,
+    UR: UserRepository + 'static,
+{
+    let order = match order_svc.order_repo.find_by_id(order_id).await {
+        Ok(Some(o)) => o,
+        Ok(None) => {
+            connections.send(
+                user_id,
+                err_event("ORDER_NOT_FOUND", "Order tidak ditemukan"),
+                Priority::Normal,
+            );
+            return None;
+        }
+        Err(e) => {
+            connections.send(
+                user_id,
+                err_event("DB_ERROR", &e.to_string()),
+                Priority::Normal,
+            );
+            return None;
+        }
+    };
+    let peer_id = match get_peer_id(role, &order, user_id) {
+        Ok(p) => p,
+        Err(e) => {
+            connections.send(
+                user_id,
+                err_event("INVALID_ORDER", &e.to_string()),
+                Priority::Normal,
+            );
+            return None;
+        }
+    };
+    Some((order, peer_id))
+}
 
 fn get_peer_id(role: &str, order: &ordermodels, user_id: &str) -> Result<String> {
     match role {

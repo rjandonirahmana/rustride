@@ -15,12 +15,19 @@ mod state;
 
 use auth::JwtService;
 use grpc::{auth::AuthServiceImpl, trip::TripServiceImpl};
-use proto::ridehailing::{
-    app_service_server::AppServiceServer, auth_service_server::AuthServiceServer,
-};
+use proto::auth::auth_service_server::AuthServiceServer;
+use proto::ridehailing::app_service_server::AppServiceServer;
 use repository::{order::MySqlOrderRepository, user::MySqlUserRepository};
 
 use crate::{
+    grpc::{
+        message::MessageServiceImpl, notification::NotificationServiceImpl, order::OrderServiceImpl,
+    },
+    proto::{
+        message::message_service_server::MessageServiceServer,
+        notification::notification_service_server::NotificationServiceServer,
+        order::order_service_server::OrderServiceServer,
+    },
     repository::{message::MessageRepository, notification, rideshare},
     state::AppState,
 };
@@ -53,25 +60,39 @@ async fn main() -> anyhow::Result<()> {
     let redis_conn = redis::aio::ConnectionManager::new(redis_client.clone()).await?;
     tracing::info!("Redis connected");
 
-    let region_provider = RegionProviderChain::first_try(Some(Region::new("us-east-1")));
-
-    let config = aws_config::defaults(BehaviorVersion::v2026_01_12())
-        .region("us-east-1")
-        .endpoint_url("http://77.237.242.1:9000") // RustFS
-        .region(region_provider)
+    let config = aws_config::defaults(BehaviorVersion::latest())
+        .endpoint_url(format!(
+            "https://{}.r2.cloudflarestorage.com",
+            cfg.r2_account_id
+        ))
+        .region(aws_sdk_s3::config::Region::new("auto")) // HARUS "auto"
         .credentials_provider(aws_sdk_s3::config::Credentials::new(
-            "rustridecompany",
-            "rustridecompany123",
+            cfg.r2_access_key,
+            cfg.r2_secret_key,
             None,
             None,
-            "loaded",
+            "static",
         ))
         .load()
         .await;
 
     let s3 = aws_sdk_s3::Client::new(&config);
+    let request = s3.list_buckets();
 
-    print!("{:?}", s3.get_bucket_acl());
+    // 2. KIRIM request ke Cloudflare (ini yang menentukan konek atau tidak)
+    let response = request.send().await;
+
+    // 3. Cek hasilnya
+    match response {
+        Ok(output) => {
+            println!("Koneksi BERHASIL!");
+            println!("Daftar bucket: {:?}", output.buckets());
+        }
+        Err(e) => {
+            println!("Koneksi GAGAL!");
+            println!("Error detail: {:?}", e);
+        }
+    }
 
     // ── Repositories & services ───────────────────────────────────────────────
     let jwt = JwtService::new(&cfg.jwt_secret);
@@ -84,16 +105,20 @@ async fn main() -> anyhow::Result<()> {
 
     let state: Arc<AppState<MySqlOrderRepository, MySqlUserRepository>> = AppState::new(
         user_repo.clone(),
-        order_repo,
+        order_repo.clone(),
         location,
         redis_conn,
         redis_client,
     );
 
+    // create a 'static str for r2_public_url by leaking a cloned String so it can live for the program lifetime
+    let r2_public_url_static: &'static str = Box::leak(cfg.r2_public_url.clone().into_boxed_str());
     let service_chat = service::chat::ChatService {
         msg_repo: message_repo.clone(),
         connections: state.connections.clone(),
         s3_client: Arc::new(s3),
+        r2_public_url: r2_public_url_static,
+        r2_bucket: Box::leak(cfg.r2_bucket_name.clone().into_boxed_str()),
     };
 
     // ── gRPC server ───────────────────────────────────────────────────────────
@@ -104,6 +129,23 @@ async fn main() -> anyhow::Result<()> {
         // AuthService — publik, tidak butuh token
         .add_service(AuthServiceServer::new(AuthServiceImpl {
             user_repo: user_repo.clone(),
+            jwt: jwt.clone(),
+        }))
+        .add_service(MessageServiceServer::new(MessageServiceImpl {
+            chat_svc: Arc::new(service_chat.clone()),
+            connections: state.connections.clone(),
+            jwt: jwt.clone(),
+            order_repo: order_repo,
+        }))
+        .add_service(NotificationServiceServer::new(NotificationServiceImpl {
+            notif_svc: Arc::new(service::notification::NotificationService {
+                notif_repo: notifrepo.clone(),
+                connections: state.connections.clone(),
+            }),
+            jwt: jwt.clone(),
+        }))
+        .add_service(OrderServiceServer::new(OrderServiceImpl {
+            order_svc: state.order_svc.clone(),
             jwt: jwt.clone(),
         }))
         // TripService — bidi stream, JWT di metadata

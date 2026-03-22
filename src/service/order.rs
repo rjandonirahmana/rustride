@@ -9,9 +9,10 @@ use crate::{
     connections::{ConnectionManager, Priority},
     location::{haversine_m, LocationService},
     models::order::{NearbyOrder, Order},
+    proto::order::{DriverInfo, FareEstimateEvent, Order as cpOrder},
     proto::ridehailing::{
-        server_event::Payload as Sp, DriverInfo, DriverLocationEvent, FareEstimateEvent,
-        NewOrderOffer, Order as cpOrder, OrderStatusEvent, ServerEvent,
+        server_event::Payload as Sp, DriverLocationEvent, NewOrderOffer, OrderStatusEvent,
+        ServerEvent,
     },
     repository::{
         order::{NewOrder, OrderRepository},
@@ -31,9 +32,9 @@ pub fn calculate_fare(distance_km: f64, service_type: &str) -> i32 {
     ((raw + 999) / 1000) * 1000
 }
 
-pub fn order_to_proto(o: &Order) -> crate::proto::ridehailing::Order {
-    crate::proto::ridehailing::Order {
-        id: o.id.clone(),
+pub fn order_to_proto(o: &Order) -> crate::proto::order::Order {
+    crate::proto::order::Order {
+        order_id: o.id.clone(),
         rider_id: o.rider_id.clone(),
         driver_id: o.driver_id.clone().unwrap_or_default(),
         status: o.status.clone(),
@@ -46,7 +47,8 @@ pub fn order_to_proto(o: &Order) -> crate::proto::ridehailing::Order {
         fare_estimate: o.fare_estimate,
         service_type: o.service_type.clone(),
         created_at: o.created_at.clone(),
-        rider_name: o.rider_name.clone(),
+
+        driver: None, // diisi terpisah oleh caller yang punya akses user_repo
     }
 }
 
@@ -283,7 +285,7 @@ where
         let event = ServerEvent {
             payload: Some(Sp::NewOrder(NewOrderOffer {
                 order: Some(cpOrder {
-                    id: order.id.clone(),
+                    order_id: order.id.clone(),
                     rider_id: order.rider_id.clone(),
                     driver_id: "".to_string(),
                     status: order.status.clone(),
@@ -296,7 +298,7 @@ where
                     fare_estimate: order.fare_estimate,
                     service_type: order.service_type.clone(),
                     created_at: order.created_at.clone(),
-                    rider_name: order.rider_name.clone(),
+                    driver: None,
                 }),
                 distance_to_pickup_m: order.distance_km.unwrap_or_default(),
                 eta_to_pickup_min: 1000.0,

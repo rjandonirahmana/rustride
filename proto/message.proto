@@ -1,0 +1,80 @@
+syntax = "proto3";
+package message;
+
+service MessageService {
+  rpc SendMessage(SendMessageReq)             returns (MessageAckEvent);
+  rpc SendMedia(SendMediaReq)                 returns (SendMediaResponse);
+  rpc MarkRead(MarkReadReq)                   returns (Empty);
+  rpc GetHistory(GetHistoryReq)               returns (HistoryEvent);
+  rpc GetConversations(Empty) returns (ConversationItems);
+  rpc GetUploadUrl(GetUploadUrlReq)           returns (GetUploadUrlRes);
+}
+
+message SendMessageReq {
+  string recipient_id = 1;
+  string content      = 2;
+  string order_id     = 3;
+}
+
+message Empty {}
+
+message SendMediaReq {
+  string client_msg_id = 1;
+  string recipient_id  = 2;
+  string media_url     = 3;
+  string media_mime    = 4;
+  int64  media_size    = 5;
+  string order_id      = 6;
+}
+
+message MarkReadReq   { string from_user_id = 1; }
+
+message GetHistoryReq {
+  string peer_id = 1;
+  int32  limit   = 2;
+  string before  = 3;
+}
+
+message GetUploadUrlReq { string mime = 1; }
+
+message MessageAckEvent   { string msg_id = 1; string status = 2; string sent_at = 3; }
+
+message SendMediaResponse { string client_msg_id = 1; string msg_id = 2; }
+
+message GetUploadUrlRes   { string upload_url = 1; string public_url = 2; }
+
+message NewMessageEvent {
+  string msg_id         = 1;
+  string sender_id      = 2;
+  string sender_name    = 3;
+  string recipient_id   = 4;
+  string content        = 5;
+  string msg_type       = 6;
+  string sent_at        = 7;
+  string media_url      = 8;
+  string media_mime     = 9;
+  int64  media_size     = 10;
+  int32  media_duration = 11;
+  string media_thumb    = 12;
+  string sender_avatar  = 13;
+  string status_order   = 14;
+}
+
+message HistoryEvent {
+  repeated NewMessageEvent messages = 1;
+  bool                     has_more = 2;
+}
+
+message ConversationItem {
+  string peer_id           = 1;
+  string peer_name         = 2;
+  string peer_avatar       = 3;
+  string last_message      = 4;
+  string last_message_type = 5;
+  string last_seen_at      = 6;
+  uint32 unread_count      = 7;
+  string order_id          = 8;
+  string order_status      = 9;
+}
+
+message ConversationItems { repeated ConversationItem items = 1; }

@@ -2,10 +2,8 @@ use std::sync::Arc;
 
 use crate::{
     connections::{ConnectionManager, Priority},
-    proto::ridehailing::{
-        server_event::Payload as Sp, NewNotificationEvent, NotificationItem, NotificationsEvent,
-        ServerEvent,
-    },
+    proto::notification::{NewNotificationEvent, NotificationItem, NotificationsEvent},
+    proto::ridehailing::{server_event::Payload as Sp, ServerEvent},
     repository::notification::NotificationRepositorytrait,
 };
 

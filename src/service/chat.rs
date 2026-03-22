@@ -1,23 +1,23 @@
 use anyhow::Result;
 use aws_sdk_s3::presigning::PresigningConfig;
-use prost::bytes;
 use std::{sync::Arc, time::Duration};
 use uuid::Uuid;
 
 use crate::{
     connections::{ConnectionManager, Priority},
     models::message::Message,
-    proto::ridehailing::{
-        server_event::Payload as Sp, ConversationItem, MessageAckEvent, NewMessageEvent,
-        ReadReceiptEvent, ServerEvent,
-    },
+    proto::message::{ConversationItem, NewMessageEvent},
+    proto::ridehailing::{server_event::Payload as Sp, ReadReceiptEvent, ServerEvent},
     repository::message::MessageRepository,
 };
 
+#[derive(Clone)]
 pub struct ChatService {
     pub msg_repo: Arc<MessageRepository>,
     pub connections: Arc<ConnectionManager>,
     pub s3_client: Arc<aws_sdk_s3::Client>,
+    pub r2_public_url: &'static str,
+    pub r2_bucket: &'static str,
 }
 
 impl ChatService {
@@ -29,7 +29,7 @@ impl ChatService {
         content: &str,
         sender: &str,
         order_id: &str,
-    ) -> Result<()> {
+    ) -> Result<Message> {
         if sender_id == recipient_id {
             anyhow::bail!("Tidak bisa mengirim pesan ke diri sendiri");
         }
@@ -58,7 +58,7 @@ impl ChatService {
 
         self.msg_repo.save(&mut msg).await?;
         self.push_message(&msg, sender).await;
-        Ok(())
+        Ok(msg)
     }
 
     /// Kirim pesan media
@@ -77,7 +77,7 @@ impl ChatService {
         }
 
         // 🔐 VALIDASI URL (WAJIB)
-        if !media_url.starts_with("http://vmi3152926.contaboserver.net/rustride/") {
+        if !media_url.contains(".r2.cloudflarestorage.com") && !media_url.contains("r2.dev") {
             anyhow::bail!("Invalid media URL");
         }
 
@@ -130,10 +130,11 @@ impl ChatService {
         let file_id = Uuid::new_v4().to_string();
         let key = format!("chat/{}/{}.{}", user_id, file_id, ext);
 
+        // 1. Generate Presigned URL untuk Client Upload
         let presigned = self
             .s3_client
             .put_object()
-            .bucket("rustride")
+            .bucket(self.r2_bucket) // Pastikan nama bucket sesuai di dashboard R2
             .key(&key)
             .content_type(mime)
             .presigned(PresigningConfig::expires_in(Duration::from_secs(300))?)
@@ -141,7 +142,10 @@ impl ChatService {
 
         let upload_url = presigned.uri().to_string();
 
-        let public_url = format!("http://vmi3152926.contaboserver.net/rustride/{}", key);
+        // 2. Gunakan URL Publik R2 Anda (Custom Domain atau r2.dev)
+        // Jangan gunakan IP Contabo jika file disimpan di Cloudflare R2
+        let public_url = format!("{}{}", self.r2_public_url, key);
+        // ATAU: format!("https://media.domainanda.com{}", key);
 
         Ok((upload_url, public_url))
     }
@@ -215,19 +219,6 @@ impl ChatService {
             &msg.recipient_id,
             Arc::new(event.clone()),
             Priority::Critical,
-        );
-
-        // Ack ke sender
-        self.connections.send(
-            &msg.sender_id,
-            Arc::new(ServerEvent {
-                payload: Some(Sp::MessageAck(MessageAckEvent {
-                    msg_id: msg.id.clone(),
-                    status: "sent".to_string(),
-                    sent_at: msg.sent_at.clone(),
-                })),
-            }),
-            Priority::Normal,
         );
 
         // Mark delivered kalau recipient online

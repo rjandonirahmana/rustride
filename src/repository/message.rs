@@ -2,7 +2,7 @@ use anyhow::Result;
 use mysql_async::{from_value, prelude::Queryable, Row};
 
 use super::db::{col, col_opt_i32, col_opt_i64, col_opt_str, exec_drop, exec_rows};
-use crate::{models::message::Message, proto::ridehailing::ConversationItem};
+use crate::{models::message::Message, proto::message::ConversationItem};
 use mysql_async::Pool;
 
 pub struct MessageRepository {

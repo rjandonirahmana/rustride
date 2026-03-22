@@ -8,7 +8,7 @@ use geohash::{encode, neighbors, Coord, Direction};
 use prost::Message;
 use redis::{aio::ConnectionManager, AsyncCommands};
 
-use crate::{models::order::DriverLocation, proto::ridehailing::DriverLocationMeta};
+use crate::{models::order::DriverLocation, proto::order::DriverLocationMeta};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 

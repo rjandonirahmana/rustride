@@ -1,0 +1,40 @@
+syntax = "proto3";
+package notification;
+
+import "google/protobuf/empty.proto";
+
+service NotificationService {
+  rpc GetNotifications(GetNotificationsReq)  returns (NotificationsEvent);
+  rpc MarkNotifRead(MarkNotifReadReq)         returns (google.protobuf.Empty);
+  rpc MarkAllNotifRead(google.protobuf.Empty) returns (google.protobuf.Empty);
+}
+
+message GetNotificationsReq {
+  int32 limit       = 1;
+  int64 before      = 2;
+  bool  unread_only = 3;
+}
+
+message MarkNotifReadReq { int64 notif_id = 1; }
+
+message NotificationItem {
+  int64  id           = 1;
+  string type         = 2;
+  string title        = 3;
+  string body         = 4;
+  string ref_order_id = 5;
+  string ref_user_id  = 6;
+  string meta         = 7;
+  bool   is_read      = 8;
+  string created_at   = 9;
+}
+
+message NotificationsEvent {
+  repeated NotificationItem items    = 1;
+  bool                      has_more = 2;
+}
+
+// Push realtime — dikirim via AppService stream
+message NewNotificationEvent {
+  NotificationItem notification = 1;
+}

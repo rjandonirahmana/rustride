@@ -1,190 +1,100 @@
 syntax = "proto3";
 package app;
 
-// ══════════════════════════════════════════════════════════════
-//  AuthService — unary
-// ══════════════════════════════════════════════════════════════
-service AuthService {
-  rpc Register(RegisterRequest) returns (AuthResponse);
-  rpc Login(LoginRequest)       returns (AuthResponse);
-}
+import "order.proto";
+import "message.proto";
+import "notification.proto";
 
-message RegisterRequest {
-  string name          = 1;
-  string phone         = 2;
-  string email         = 3;
-  string password      = 4;
-  string role          = 5;
-  string vehicle_type  = 6;
-  string vehicle_plate = 7;
-  string vehicle_model = 8;
-  string vehicle_color = 9;
-}
-
-message LoginRequest {
-  string phone    = 1;
-  string password = 2;
-}
-
-message AuthResponse {
-  string token   = 1;
-  string user_id = 2;
-  string role    = 3;
-  string name    = 4;
-}
-
-// ══════════════════════════════════════════════════════════════
-//  AppService — bidirectional stream
-// ══════════════════════════════════════════════════════════════
 service AppService {
   rpc Stream(stream ClientEvent) returns (stream ServerEvent);
 }
 
-// ── CLIENT → SERVER ──────────────────────────────────────────
 message ClientEvent {
   oneof payload {
-    // ── shared ──
-    PingReq ping = 1;
+    PingReq            ping             = 1;
+    WatchDriversReq    watch_drivers    = 2;
+    LocationUpdate     location         = 3;
+    BrowseOrdersReq    browse_orders    = 5;
+    AcceptOrderReq     accept_order     = 6;
+    RejectOrderReq     reject_order     = 7;
+    ArrivedReq         arrived          = 8;
+    StartTripReq       start_trip       = 9;
+    CompleteTripReq    complete_trip    = 10;
+    CancelTripReq      cancel_trip      = 11;
+    WatchUserReq       watch_user       = 15;
+    BrowseRideshareReq browse_rideshare = 20;
+    JoinRideshareReq   join_rideshare   = 21;
+    CancelRideshareReq cancel_rideshare = 22;
+    AcceptPassengerReq accept_passenger = 23;
+    RejectPassengerReq reject_passenger = 24;
+    PickupPassengerReq pickup_passenger = 25;
+    DropPassengerReq   drop_passenger   = 26;
+    OpenRideshareReq   open_rideshare   = 27;
+    CallOffer          call_offer       = 32;
+    CallAnswer         call_answer      = 33;
+    IceCandidate       ice_candidate    = 34;
+    EndCallReq         end_call         = 35;
+    EstimateFareReq    estimate_fare    = 36;
+    RateReq            rate             = 37;
 
-    // ── ride-hailing ──
-    WatchDriversReq watch_drivers = 2;
-    LocationUpdate  location      = 3;
-    CreateOrderReq  create_order  = 4;
-    BrowseOrdersReq browse_orders = 5;
-    AcceptOrderReq  accept_order  = 6;
-    RejectOrderReq  reject_order  = 7;
-    ArrivedReq      arrived       = 8;
-    StartTripReq    start_trip    = 9;
-    CompleteTripReq complete_trip = 10;
-    CancelTripReq   cancel_trip   = 11;
-
-    // ── chat ──
-    SendMessageReq    send_message     = 12;
-    SendMediaReq      send_media       = 13;
-    MarkReadReq       mark_read        = 14;
-    WatchUserReq      watch_user       = 15;
-    GetHistoryReq     get_history      = 16;
-    GetActiveOrderReq get_active_order = 17;
-    RateReq           rate             = 18;
-    EstimateFareReq   estimate_fare    = 19;
-
-    // ── rideshare / nebeng ──
-    BrowseRideshareReq browse_rideshare = 20; // rider: cari trip yang bisa diikuti
-    JoinRideshareReq   join_rideshare   = 21; // rider: request nebeng
-    CancelRideshareReq cancel_rideshare = 22; // rider: cancel request / keluar
-    AcceptPassengerReq accept_passenger = 23; // driver: terima penumpang
-    RejectPassengerReq reject_passenger = 24; // driver: tolak penumpang
-    PickupPassengerReq pickup_passenger = 25; // driver: sudah jemput penumpang
-    DropPassengerReq   drop_passenger   = 26; // driver: sudah antar penumpang
-    OpenRideshareReq   open_rideshare   = 27; // driver: buka trip untuk nebeng
-
-    // ── notifications ──
-    GetNotificationsReq get_notifications   = 28; // ambil daftar notif
-    MarkNotifReadReq    mark_notif_read     = 29; // tandai notif sudah dibaca
-    MarkAllNotifReadReq mark_all_notif_read = 30;
-    MessageReq          get_message_req     = 31;
-    CallOffer           call_offer          = 32;
-    CallAnswer          call_answer         = 33;
-    IceCandidate        ice_candidate       = 34;
-    EndCallReq          end_call            = 35;
-    GetUploadUrlReq get_upload_url = 36;
   }
 }
 
-// ── SERVER → CLIENT ──────────────────────────────────────────
 message ServerEvent {
   oneof payload {
-    // ── shared ──
-    ConnectedEvent connected = 1;
-    PongEvent      pong      = 2;
-    ErrorEvent     error     = 3;
-
-    // ── ride-hailing ──
-    OrderCreatedEvent   order_created  = 4;
-    NearbyDriversEvent  nearby_drivers = 5;
-    NearbyOrdersEvent   nearby_orders  = 6;
-    NewOrderOffer       new_order      = 7;
-    OrderStatusEvent    order_status   = 8;
-    DriverLocationEvent driver_loc     = 9;
-
-    // ── chat ──
-    NewMessageEvent   new_message   = 10;
-    MessageAckEvent   message_ack   = 11;
-    ReadReceiptEvent  read_receipt  = 12;
-    PresenceEvent     presence      = 13;
-    HistoryEvent      history       = 14;
-    RatedEvent        rated         = 15;
-    FareEstimateEvent fare_estimate = 16;
-
-    // ── rideshare / nebeng ──
-    NearbyRideshareEvent  nearby_rideshare  = 17; // hasil browse
-    RideshareJoinedEvent  rideshare_joined  = 18; // konfirmasi rider berhasil request
-    PassengerRequestEvent passenger_request = 19; // driver: ada rider mau nebeng
-    PassengerStatusEvent  passenger_status  = 20; // rider: status request (accepted/rejected)
-    RideshareStatusEvent  rideshare_status  = 21; // update status trip (full/open/started/done)
-    RideshareOpenedEvent  rideshare_opened  = 22; // konfirmasi driver buka trip
-
-    // ── notifications ──
-    NotificationsEvent   notifications        = 23; // list notif
-    NewNotificationEvent new_notification     = 24; // push notif baru (realtime)
-    ConversationItems    conversation_items   = 25;
-    IncomingCallOffer    incoming_call_offer  = 26;
-    IncomingCallAnswer   incoming_call_answer = 27;
-    IceCandidateEvent    ice_candidate_event  = 28;
-    CallEndedEvent       call_ended           = 29;
-    CurrentOrder         current_order        = 30;
-    SendMediaResponse send_media_response = 31;
-    GetUploadUrlRes upload_url_res = 32;
-
+    ConnectedEvent                    connected         = 1;
+    PongEvent                         pong              = 2;
+    ErrorEvent                        error             = 3;
+    NearbyDriversEvent                nearby_drivers    = 5;
+    NearbyOrdersEvent                 nearby_orders     = 6;
+    NewOrderOffer                     new_order         = 7;
+    OrderStatusEvent                  order_status      = 8;
+    DriverLocationEvent               driver_loc        = 9;
+    message.NewMessageEvent           new_message       = 10;  // push dari server
+    ReadReceiptEvent                  read_receipt      = 12;
+    PresenceEvent                     presence          = 13;
+    RatedEvent                        rated             = 15;
+    NearbyRideshareEvent              nearby_rideshare  = 17;
+    RideshareJoinedEvent              rideshare_joined  = 18;
+    PassengerRequestEvent             passenger_request = 19;
+    PassengerStatusEvent              passenger_status  = 20;
+    RideshareStatusEvent              rideshare_status  = 21;
+    RideshareOpenedEvent              rideshare_opened  = 22;
+    notification.NewNotificationEvent new_notification  = 24;
+    IncomingCallOffer                 incoming_call     = 26;
+    IncomingCallAnswer                call_answer       = 27;
+    IceCandidateEvent                 ice_candidate     = 28;
+    CallEndedEvent                    call_ended        = 29;
+    order.ActiveOrderEvent            current_order     = 30;
+    order.FareEstimateEvent           fare_estimate     = 31;
+    NotificationsEvent                notifications     = 32;
   }
 }
 
-message ActivityUser {
-  repeated Order orders = 1;
+// ── Shared ────────────────────────────────────────────────────
+message PingReq          {}
+
+message PongEvent        {}
+
+message ConnectedEvent   { string user_id = 1; string role = 2; string username = 3; }
+
+message ErrorEvent       { string code = 1; string message = 2; }
+
+message RatedEvent       { string order_id = 1; uint32 rating = 2; }
+
+message WatchUserReq     { string target_user_id = 1; }
+
+message ReadReceiptEvent { string from_user_id = 1; string read_at = 2; }
+
+message PresenceEvent    { string user_id = 1; bool online = 2; string last_seen = 3; }
+
+message EstimateFareReq {
+  double pickup_lat   = 1;
+  double pickup_lng   = 2;
+  double dest_lat     = 3;
+  double dest_lng     = 4;
+  string service_type = 5;
 }
-
-message GetActivityUser {
-  repeated Order orders = 1;
-}
-
-
-message GetUploadUrlReq {
-  string mime = 1;
-}
-
-message GetUploadUrlRes {
-  string upload_url = 1;
-  string public_url = 2;
-}
-message ConversationItem {
-  string peer_id           = 1;
-  string peer_name         = 2;
-  string peer_avatar       = 3;
-  string last_message      = 4;
-  string last_message_type = 5;
-  string last_seen_at      = 6;
-  uint32 unread_count      = 7;
-  string order_id          = 8;
-  string order_status      = 9; // ← tambah ini
-
-}
-
-message ConversationItems  {
-  repeated ConversationItem items = 1;
-}
-
-// ══════════════════════════════════════════════════════════════
-//  Shared
-// ══════════════════════════════════════════════════════════════
-message PingReq        {}
-
-message MessageReq        {}
-
-message PongEvent      {}
-
-message ConnectedEvent { string user_id = 1; string role = 2; string username = 3; }
-
-message ErrorEvent     { string code = 1; string message = 2; }
 
 message RateReq {
   string order_id = 1;
@@ -193,38 +103,27 @@ message RateReq {
   double tip      = 4;
 }
 
-message RatedEvent {
-  string order_id = 1;
-  uint32 rating   = 2;
+message NotificationsEvent {
+  repeated NotificationItem items    = 1;
+  bool                      has_more = 2;
 }
 
-// ══════════════════════════════════════════════════════════════
-//  Ride-hailing (existing, tidak berubah)
-// ══════════════════════════════════════════════════════════════
-message WatchDriversReq  { double lat = 1; double lng = 2; string service_type = 3; }
-
-message LocationUpdate   { double lat = 1; double lng = 2; float heading = 3; float speed = 4; }
-
-message CreateOrderReq {
-  double pickup_lat     = 1;
-  double pickup_lng     = 2;
-  string pickup_address = 3;
-  double dest_lat       = 4;
-  double dest_lng       = 5;
-  string dest_address   = 6;
-  string service_type   = 7;
+message NotificationItem {
+  int64  id         = 1;
+  string title      = 2;
+  string body       = 3;
+  string type       = 4;
+  string ref_id     = 5;
+  bool   is_read    = 6;
+  int64  created_at = 7;
 }
 
-message BrowseOrdersReq  { double lat = 1; double lng = 2; string service_type = 3; float radius_km = 4; }
+// ── Ride-hailing ──────────────────────────────────────────────
+message WatchDriversReq { double lat = 1; double lng = 2; string service_type = 3; }
 
-message EstimateFareReq  { double pickup_lat = 1; double pickup_lng = 2; double dest_lat = 3; double dest_lng = 4; string service_type = 5; }
+message LocationUpdate  { double lat = 1; double lng = 2; float heading = 3; float speed = 4; }
 
-message FareEstimateEvent {
-  int32  fare_estimate = 1;
-  float  distance_km   = 2;
-  int32  duration_min  = 3;
-  string service_type  = 4;
-}
+message BrowseOrdersReq { double lat = 1; double lng = 2; string service_type = 3; float radius_km = 4; }
 
 message AcceptOrderReq  { string order_id = 1; }
 
@@ -238,8 +137,6 @@ message CompleteTripReq { string order_id = 1; float distance_km = 2; }
 
 message CancelTripReq   { string order_id = 1; string reason = 2; }
 
-message OrderCreatedEvent  { string order_id = 1; int32 fare_estimate = 2; string service_type = 3; }
-
 message NearbyDriversEvent { repeated NearbyDriverItem drivers = 1; }
 
 message NearbyDriverItem {
@@ -252,350 +149,128 @@ message NearbyDriverItem {
 
 message NearbyOrdersEvent { repeated NearbyOrderItem orders = 1; uint32 total = 2; }
 
-message NearbyOrderItem   { Order order = 1; float distance_to_pickup_m = 2; float eta_to_pickup_min = 3; }
+message NearbyOrderItem   { order.Order order = 1; float distance_to_pickup_m = 2; float eta_to_pickup_min = 3; }
 
 message NewOrderOffer {
-  Order  order                = 1;
-  float  distance_to_pickup_m = 2;
-  float  eta_to_pickup_min    = 3;
-  uint32 timeout_secs         = 4;
+  order.Order order                = 1;
+  float       distance_to_pickup_m = 2;
+  float       eta_to_pickup_min    = 3;
+  uint32      timeout_secs         = 4;
 }
 
-message CurrentOrder {
-  Order order = 1;
+message OrderStatusEvent {
+  string           order_id      = 1;
+  string           status        = 2;
+  order.DriverInfo driver        = 3;
+  string           service_type  = 4;
+  int32            fare_estimate = 5;
 }
 
-message OrderStatusEvent    { string order_id = 1; string status = 2; DriverInfo driver = 3;  string service_type = 4; // tambah
-  int32 fare_estimate = 5; }
+message DriverLocationEvent { string order_id = 1; double lat = 2; double lng = 3; float heading = 4; }
 
-  message DriverLocationEvent { string order_id = 1; double lat = 2; double lng = 3; float heading = 4; }
+// ── Rideshare ─────────────────────────────────────────────────
+message OpenRideshareReq   { string order_id = 1; int32 max_passengers = 2; int32 join_deadline_s = 3; }
 
-  message Order {
-    string id             = 1;
-    string rider_id       = 2;
-    string driver_id      = 3;
-    string status         = 4;
-    double pickup_lat     = 5;
-    double pickup_lng     = 6;
-    string pickup_address = 7;
-    double dest_lat       = 8;
-    double dest_lng       = 9;
-    string dest_address   = 10;
-    int32  fare_estimate  = 11;
-    string service_type   = 12;
-    string created_at     = 13;
-    string rider_name     = 14;
-  }
-
-  message DriverInfo {
-    string user_id       = 1;
-    string name          = 2;
-    string phone         = 3;
-    string vehicle_plate = 4;
-    string vehicle_model = 5;
-    string vehicle_color = 6;
-    float  rating        = 7;
-  }
-
-// ══════════════════════════════════════════════════════════════
-//  Chat (existing, tidak berubah)
-// ══════════════════════════════════════════════════════════════
-  message SendMessageReq  { string recipient_id = 1; string content = 2; string order_id = 3; }
-
-message SendMediaReq {
-  string client_msg_id = 1; // 🔥 dari client
-  string recipient_id  = 2;
-  string media_url     = 3;
-  string media_mime    = 4;
-  int64  media_size    = 5;
-  string order_id      = 6;
+message BrowseRideshareReq {
+  double dest_lat     = 1;
+  double dest_lng     = 2;
+  double pickup_lat   = 3;
+  double pickup_lng   = 4;
+  string service_type = 5;
+  float  radius_km    = 6;
 }
 
-  message MarkReadReq       { string from_user_id   = 1; }
-
-  message WatchUserReq      { string target_user_id = 1; }
-
-  message GetActiveOrderReq {}
-
-  message GetHistoryReq {
-    string peer_id = 1;
-    int32  limit   = 2;
-    string before  = 3;
-  }
-
-  message NewMessageEvent {
-    string msg_id         = 1;
-    string sender_id      = 2;
-    string sender_name    = 3;
-    string recipient_id   = 4;
-    string content        = 5;
-    string msg_type       = 6;
-    string sent_at        = 7;
-    string media_url      = 8;
-    string media_mime     = 9;
-    int64  media_size     = 10;
-    int32  media_duration = 11;
-    string media_thumb    = 12;
-    string sender_avatar  = 13;
-    string status_order   = 14;
-  }
-message SendMediaResponse {
-  string client_msg_id = 1;
-  string msg_id        = 2;
+message JoinRideshareReq {
+  string trip_id        = 1;
+  double pickup_lat     = 2;
+  double pickup_lng     = 3;
+  string pickup_address = 4;
+  double dest_lat       = 5;
+  double dest_lng       = 6;
+  string dest_address   = 7;
 }
-  message MessageAckEvent  { string msg_id = 1; string status = 2; string sent_at = 3; }
 
-  message ReadReceiptEvent { string from_user_id = 1; string read_at = 2; }
+message CancelRideshareReq { string passenger_id = 1; string trip_id = 2; string reason = 3; }
 
-  message PresenceEvent {
-    string user_id   = 1;
-    bool   online    = 2;
-    string last_seen = 3;
-  }
+message AcceptPassengerReq { string passenger_id = 1; string trip_id = 2; }
 
-  message HistoryEvent {
-    repeated NewMessageEvent messages = 1;
-    bool                     has_more = 2;
-  }
+message RejectPassengerReq { string passenger_id = 1; string trip_id = 2; string reason = 3; }
 
-  message UserInfo {
-    string user_id    = 1;
-    string username   = 2;
-    string avatar_url = 3;
-  }
+message PickupPassengerReq { string passenger_id = 1; string trip_id = 2; }
 
-// ══════════════════════════════════════════════════════════════
-//  Rideshare / Nebeng
-// ══════════════════════════════════════════════════════════════
+message DropPassengerReq   { string passenger_id = 1; string trip_id = 2; float distance_km = 3; }
 
-// Driver: buka trip untuk nebeng (setelah punya order sendiri)
-  message OpenRideshareReq {
-    string order_id        = 1; // host_order_id milik driver
-    int32  max_passengers  = 2; // kapasitas (default 3)
-    int32  join_deadline_s = 3; // detik dari sekarang (0 = tidak ada batas)
-  }
+message NearbyRideshareEvent  { repeated RideshareItem trips = 1; }
 
-  message RideshareOpenedEvent {
-    string trip_id        = 1;
-    string order_id       = 2;
-    int32  max_passengers = 3;
-  }
+message RideshareJoinedEvent  { string passenger_id = 1; string trip_id = 2; int32 fare_estimate = 3; string status = 4; }
 
-// Rider: cari trip nebeng yang searah
-  message BrowseRideshareReq {
-    double dest_lat     = 1; // tujuan rider
-    double dest_lng     = 2;
-    double pickup_lat   = 3; // posisi rider saat ini
-    double pickup_lng   = 4;
-    string service_type = 5;
-    float  radius_km    = 6; // radius pencarian (default 5km)
-  }
+message RideshareOpenedEvent  { string trip_id = 1; string order_id = 2; int32 max_passengers = 3; }
 
-  message NearbyRideshareEvent {
-    repeated RideshareItem trips = 1;
-  }
+message RideshareItem {
+  string trip_id         = 1;
+  string driver_id       = 2;
+  string driver_name     = 3;
+  string driver_avatar   = 4;
+  string vehicle_plate   = 5;
+  string vehicle_model   = 6;
+  string vehicle_color   = 7;
+  float  driver_rating   = 8;
+  string service_type    = 9;
+  double route_start_lat = 10;
+  double route_start_lng = 11;
+  double route_end_lat   = 12;
+  double route_end_lng   = 13;
+  int32  seats_available = 14;
+  int32  fare_estimate   = 15;
+  float  distance_km     = 16;
+  string join_deadline   = 17;
+}
 
-  message RideshareItem {
-    string trip_id         = 1;
-    string driver_id       = 2;
-    string driver_name     = 3;
-    string driver_avatar   = 4;
-    string vehicle_plate   = 5;
-    string vehicle_model   = 6;
-    string vehicle_color   = 7;
-    float  driver_rating   = 8;
-    string service_type    = 9;
-    double route_start_lat = 10;
-    double route_start_lng = 11;
-    double route_end_lat   = 12;
-    double route_end_lng   = 13;
-    int32  seats_available = 14;
-    int32  fare_estimate   = 15; // fare khusus rider ini (dihitung di server)
-    float  distance_km     = 16; // jarak rider ke pickup driver
-    string join_deadline   = 17; // ISO timestamp
-  }
+message PassengerRequestEvent {
+  string passenger_id   = 1;
+  string trip_id        = 2;
+  string rider_id       = 3;
+  string rider_name     = 4;
+  string rider_avatar   = 5;
+  double pickup_lat     = 6;
+  double pickup_lng     = 7;
+  string pickup_address = 8;
+  double dest_lat       = 9;
+  double dest_lng       = 10;
+  string dest_address   = 11;
+  int32  fare_estimate  = 12;
+  float  distance_km    = 13;
+}
 
-// Rider: request join trip
-  message JoinRideshareReq {
-    string trip_id        = 1;
-    double pickup_lat     = 2;
-    double pickup_lng     = 3;
-    string pickup_address = 4;
-    double dest_lat       = 5;
-    double dest_lng       = 6;
-    string dest_address   = 7;
-  }
+message PassengerStatusEvent {
+  string passenger_id  = 1;
+  string trip_id       = 2;
+  string status        = 3;
+  string reason        = 4;
+  int32  fare_estimate = 5;
+}
 
-// Server → Rider: konfirmasi request terkirim
-  message RideshareJoinedEvent {
-    string passenger_id  = 1; // rideshare_passengers.id
-    string trip_id       = 2;
-    int32  fare_estimate = 3;
-    string status        = 4; // "pending"
-  }
+message RideshareStatusEvent {
+  string trip_id          = 1;
+  string status           = 2;
+  int32  seats_available  = 3;
+  string passenger_id     = 4;
+  string passenger_status = 5;
+}
 
-// Server → Driver: ada rider yang mau nebeng
-  message PassengerRequestEvent {
-    string passenger_id   = 1;
-    string trip_id        = 2;
-    string rider_id       = 3;
-    string rider_name     = 4;
-    string rider_avatar   = 5;
-    double pickup_lat     = 6;
-    double pickup_lng     = 7;
-    string pickup_address = 8;
-    double dest_lat       = 9;
-    double dest_lng       = 10;
-    string dest_address   = 11;
-    int32  fare_estimate  = 12;
-    float  distance_km    = 13; // jarak dari rute driver ke pickup rider
-  }
+// ── WebRTC ────────────────────────────────────────────────────
+message CallOffer          { string target_user_id = 1; string sdp = 2; string order_id = 3; }
 
-// Driver: terima penumpang
-  message AcceptPassengerReq {
-    string passenger_id = 1;
-    string trip_id      = 2;
-  }
+message CallAnswer         { string caller_id = 1; string sdp = 2; }
 
-// Driver: tolak penumpang
-  message RejectPassengerReq {
-    string passenger_id = 1;
-    string trip_id      = 2;
-    string reason       = 3;
-  }
+message IceCandidate       { string peer_id = 1; string candidate = 2; }
 
-// Server → Rider: status request nebeng diupdate driver
-  message PassengerStatusEvent {
-    string passenger_id  = 1;
-    string trip_id       = 2;
-    string status        = 3; // "accepted" | "rejected"
-    string reason        = 4; // jika rejected
-    int32  fare_estimate = 5;
-  }
+message EndCallReq         { string peer_id = 1; }
 
-// Driver: sudah jemput passenger tertentu
-  message PickupPassengerReq {
-    string passenger_id = 1;
-    string trip_id      = 2;
-  }
+message IncomingCallOffer  { string caller_id = 1; string sdp = 2; }
 
-// Driver: sudah antar passenger ke tujuan
-  message DropPassengerReq {
-    string passenger_id = 1;
-    string trip_id      = 2;
-    float  distance_km  = 3;
-  }
+message IncomingCallAnswer { string callee_id = 1; string sdp = 2; }
 
-// Rider: cancel nebeng
-  message CancelRideshareReq {
-    string passenger_id = 1;
-    string trip_id      = 2;
-    string reason       = 3;
-  }
+message IceCandidateEvent  { string peer_id = 1; string candidate = 2; }
 
-// Server → semua pihak terkait: status trip berubah
-  message RideshareStatusEvent {
-    string trip_id          = 1;
-    string status           = 2; // "open"|"full"|"in_progress"|"completed"|"cancelled"
-    int32  seats_available  = 3;
-    string passenger_id     = 4; // passenger mana yang memicu event ini (opsional)
-    string passenger_status = 5; // status passenger terkait
-  }
-
-// ══════════════════════════════════════════════════════════════
-//  Notifications
-// ══════════════════════════════════════════════════════════════
-
-  message GetNotificationsReq {
-    int32 limit       = 1; // default 20
-    int64 before      = 2; // cursor: notif.id terakhir yang sudah di-load (0 = dari awal)
-    bool  unread_only = 3;
-  }
-
-  message MarkNotifReadReq    { int64 notif_id = 1; }
-
-  message MarkAllNotifReadReq {}
-
-  message NotificationItem {
-    int64  id           = 1;
-    string type         = 2;
-    string title        = 3;
-    string body         = 4;
-    string ref_order_id = 5;
-    string ref_user_id  = 6;
-    string meta         = 7; // JSON string
-    bool   is_read      = 8;
-    string created_at   = 9;
-  }
-
-  message NotificationsEvent {
-    repeated NotificationItem items    = 1;
-    bool                      has_more = 2;
-  }
-
-// Push realtime saat ada notif baru
-  message NewNotificationEvent {
-    NotificationItem notification = 1;
-  }
-
-  message DriverLocationMeta {
-  // latitude driver
-    double lat = 1;
-
-  // longitude driver
-    double lng = 2;
-
-  // arah kendaraan (0-360 derajat)
-    double heading = 3;
-
-  // kecepatan kendaraan
-    double speed = 4;
-
-  // timestamp dalam millisecond
-    int64 ts = 5;
-  }
-
-  // caller → server
-  message CallOffer {
-    string target_user_id = 1;
-    string sdp            = 2;
-    string order_id       = 3;
-  }
-
-// callee menerima dari server
-  message IncomingCallOffer {
-    string caller_id = 1;
-    string sdp       = 2;
-  }
-
-// callee → server
-  message CallAnswer {
-    string caller_id = 1;
-    string sdp       = 2;
-  }
-
-// caller menerima dari server
-  message IncomingCallAnswer {
-    string callee_id = 1;
-    string sdp       = 2;
-  }
-
-// client → server
-  message IceCandidate {
-    string peer_id   = 1;
-    string candidate = 2;
-  }
-
-// server → peer
-  message IceCandidateEvent {
-    string peer_id   = 1;
-    string candidate = 2;
-  }
-
-  message EndCallReq {
-    string peer_id = 1;
-  }
-
-  message CallEndedEvent {
-    string peer_id = 1;
-  }
+message CallEndedEvent     { string peer_id = 1; }
