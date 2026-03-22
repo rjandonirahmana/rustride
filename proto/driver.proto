@@ -1,0 +1,101 @@
+syntax = "proto3";
+package driver;
+
+service DriverService {
+  // Order history hari ini
+  rpc GetTodayOrders(GetTodayOrdersReq)     returns (TodayOrdersRes);
+  // Summary earnings hari ini
+  rpc GetTodaySummary(GetTodaySummaryReq)   returns (TodaySummaryRes);
+  // Order history dengan filter (pagination)
+  rpc GetOrderHistory(GetOrderHistoryReq)   returns (OrderHistoryRes);
+  // Detail satu order
+  rpc GetOrderDetail(GetOrderDetailReq)     returns (DriverOrderDetail);
+}
+
+// ── Request ───────────────────────────────────────────────────────────────────
+
+message GetTodayOrdersReq  {}
+
+message GetTodaySummaryReq {}
+
+message GetOrderHistoryReq {
+  string date_from = 1; // ISO date: "2026-03-01"
+  string date_to   = 2; // ISO date: "2026-03-22"
+  string status    = 3; // "" = semua, "completed", "cancelled"
+  int32  page      = 4; // mulai dari 1
+  int32  limit     = 5; // default 20
+}
+
+message GetOrderDetailReq {
+  string order_id = 1;
+}
+
+// ── Today Summary ─────────────────────────────────────────────────────────────
+
+message TodaySummaryRes {
+  int32  total_orders     = 1; // jumlah trip selesai hari ini
+  int32  cancelled_orders = 2; // trip dibatalkan hari ini
+  int64  gross_earnings   = 3; // total pendapatan kotor (dalam rupiah)
+  int64  net_earnings     = 4; // setelah potongan platform
+  int64  tips             = 5; // total tip dari rider
+  float  online_minutes   = 6; // total menit online hari ini
+  float  distance_km      = 7; // total jarak tempuh hari ini
+  float  avg_rating       = 8; // rating rata-rata hari ini
+  string peak_hour        = 9; // jam paling produktif, e.g. "17:00-18:00"
+}
+
+// ── Today Orders ──────────────────────────────────────────────────────────────
+
+message TodayOrdersRes {
+  repeated DriverOrderItem orders  = 1;
+  TodaySummaryRes          summary = 2;
+}
+
+// ── Order Item (ringkas, untuk list) ─────────────────────────────────────────
+
+message DriverOrderItem {
+  string order_id       = 1;
+  string status         = 2; // "completed" | "cancelled"
+  string rider_name     = 3;
+  string pickup_address = 4;
+  string dest_address   = 5;
+  float  distance_km    = 6;
+  int32  duration_min   = 7;
+  int64  fare           = 8; // fare yang dibayar rider
+  int64  driver_earning = 9; // fare dikurangi potongan platform
+  int64  tip            = 10;
+  string service_type   = 11; // "mobil" | "motor" | "send"
+  string started_at     = 12; // ISO datetime
+  string completed_at   = 13; // ISO datetime, kosong jika cancelled
+  string cancel_reason  = 14; // kosong jika completed
+  float  rating         = 15; // 0 = belum dirating
+  string rating_comment = 16;
+}
+
+// ── Order Detail (lengkap) ────────────────────────────────────────────────────
+
+message DriverOrderDetail {
+  DriverOrderItem     order        = 1;
+  double              pickup_lat   = 2;
+  double              pickup_lng   = 3;
+  double              dest_lat     = 4;
+  double              dest_lng     = 5;
+  string              rider_phone  = 6;
+  string              rider_avatar = 7;
+  float               rider_rating = 8; // rating rider sebagai penumpang
+  repeated RoutePoint route        = 9; // titik-titik rute perjalanan
+}
+
+message RoutePoint {
+  double lat = 1;
+  double lng = 2;
+  int64  ts  = 3; // unix timestamp
+}
+
+// ── History (multi-day) ───────────────────────────────────────────────────────
+
+message OrderHistoryRes {
+  repeated DriverOrderItem orders   = 1;
+  bool                     has_more = 2;
+  int32                    total    = 3;
+}

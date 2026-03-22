@@ -17,3 +17,7 @@ pub mod message {
 pub mod notification {
     tonic::include_proto!("notification");
 }
+
+pub mod driver {
+    tonic::include_proto!("driver");
+}

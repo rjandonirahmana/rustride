@@ -8,7 +8,9 @@ fn main() {
                 "proto/order.proto",
                 "proto/message.proto",
                 "proto/notification.proto",
-                "proto/auth.proto",
+                "proto/auth.p
+                roto",
+                "proto/driver.proto",
             ],
             &["proto"],
         )

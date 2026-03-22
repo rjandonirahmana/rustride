@@ -21,14 +21,16 @@ use repository::{order::MySqlOrderRepository, user::MySqlUserRepository};
 
 use crate::{
     grpc::{
-        message::MessageServiceImpl, notification::NotificationServiceImpl, order::OrderServiceImpl,
+        driver::DriverServiceImpl, message::MessageServiceImpl,
+        notification::NotificationServiceImpl, order::OrderServiceImpl,
     },
     proto::{
-        message::message_service_server::MessageServiceServer,
+        driver::driver_service_server, message::message_service_server::MessageServiceServer,
         notification::notification_service_server::NotificationServiceServer,
         order::order_service_server::OrderServiceServer,
     },
-    repository::{message::MessageRepository, notification, rideshare},
+    repository::{driver, message::MessageRepository, notification, rideshare},
+    service::driver::DriverService,
     state::AppState,
 };
 
@@ -97,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
     // ── Repositories & services ───────────────────────────────────────────────
     let jwt = JwtService::new(&cfg.jwt_secret);
     let user_repo = Arc::new(MySqlUserRepository::new(pool.clone()));
+    let driver_repo = Arc::new(driver::MySqlDriverRepository::new(pool.clone()));
     let message_repo = Arc::new(MessageRepository::new(pool.clone()));
     let order_repo = Arc::new(MySqlOrderRepository::new(pool.clone()));
     let location = location::LocationService::new(redis_conn.clone());
@@ -121,6 +124,8 @@ async fn main() -> anyhow::Result<()> {
         r2_bucket: Box::leak(cfg.r2_bucket_name.clone().into_boxed_str()),
     };
 
+    let driver_service = Arc::new(DriverService::new(driver_repo));
+
     // ── gRPC server ───────────────────────────────────────────────────────────
     let addr: std::net::SocketAddr = cfg.grpc_addr.parse()?;
     tracing::info!("gRPC listening on {}", addr);
@@ -137,6 +142,12 @@ async fn main() -> anyhow::Result<()> {
             jwt: jwt.clone(),
             order_repo: order_repo,
         }))
+        .add_service(driver_service_server::DriverServiceServer::new(
+            DriverServiceImpl {
+                driver_svc: driver_service,
+                jwt: jwt.clone(),
+            },
+        ))
         .add_service(NotificationServiceServer::new(NotificationServiceImpl {
             notif_svc: Arc::new(service::notification::NotificationService {
                 notif_repo: notifrepo.clone(),

@@ -407,3 +407,295 @@ SET @sql = IF(
 PREPARE stmt FROM @sql;
 EXECUTE stmt;
 DEALLOCATE PREPARE stmt;
+
+
+
+-- ============================================================
+-- Migration 003: Driver Daily Summary
+-- ============================================================
+--
+-- Arsitektur:
+--
+--   driver_daily_summary
+--   └── satu row per (driver_id, date)
+--       di-upsert setiap kali order completed/cancelled
+--       sehingga GetTodaySummary = SELECT 1 row, bukan aggregate
+--
+-- Update trigger:
+--   - order completed  → increment semua kolom earning/trip/distance
+--   - order cancelled  → increment cancelled_orders saja
+--   - rating masuk     → recalculate avg_rating (running average)
+--   - online_minutes   → di-update dari backend saat driver go offline
+--     (karena tracking waktu online ada di Rust/Redis, bukan DB trigger)
+--
+-- Kenapa tidak pakai materialized view atau aggregate on-the-fly?
+--   - MySQL tidak punya materialized view
+--   - Aggregate setiap request = full scan orders per driver per hari
+--   - Dengan tabel ini GetTodaySummary = O(1) index lookup
+-- ============================================================
+
+USE ridehailing;
+
+CREATE TABLE IF NOT EXISTS driver_daily_summary (
+    id                  BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    driver_id           VARCHAR(36)     NOT NULL,
+    summary_date        DATE            NOT NULL,           -- YYYY-MM-DD, waktu lokal server
+
+    -- Trip counts
+    total_orders        SMALLINT UNSIGNED NOT NULL DEFAULT 0,     -- completed
+    cancelled_orders    SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+
+    -- Earnings (dalam rupiah, integer)
+    gross_earnings      INT UNSIGNED    NOT NULL DEFAULT 0,        -- total fare_final dari rider
+    platform_fee        INT UNSIGNED    NOT NULL DEFAULT 0,        -- potongan platform
+    net_earnings        INT UNSIGNED    NOT NULL DEFAULT 0,        -- gross - platform_fee
+    tips                INT UNSIGNED    NOT NULL DEFAULT 0,        -- total tip dari ratings
+
+    -- Activity
+    online_minutes      SMALLINT UNSIGNED NOT NULL DEFAULT 0,      -- diisi backend saat go offline
+    distance_km         DECIMAL(8,2)    NOT NULL DEFAULT 0.00,     -- total jarak semua trip hari ini
+
+    -- Rating (running average)
+    rating_sum          DECIMAL(8,2)    NOT NULL DEFAULT 0.00,     -- sum semua score rating hari ini
+    rating_count        SMALLINT UNSIGNED NOT NULL DEFAULT 0,      -- jumlah rating yang masuk
+    avg_rating          DECIMAL(3,2)    NOT NULL DEFAULT 0.00,     -- rating_sum / rating_count
+
+    -- Peak hour (diisi backend, format "HH:00-HH:00")
+    peak_hour           VARCHAR(15)     NULL,
+
+    updated_at          DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+                            ON UPDATE CURRENT_TIMESTAMP(3),
+
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_driver_date (driver_id, summary_date),   -- 1 row per driver per hari
+    INDEX idx_dds_date   (summary_date),
+    INDEX idx_dds_driver (driver_id),
+
+    CONSTRAINT fk_dds_driver
+        FOREIGN KEY (driver_id) REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+
+-- ============================================================
+-- TRIGGER: upsert summary saat order completed
+-- ============================================================
+-- Dipanggil AFTER UPDATE orders WHERE status berubah ke 'completed'
+-- fare_final, distance_km, driver_id sudah terisi saat ini
+
+DROP TRIGGER IF EXISTS trg_order_completed_summary;
+DELIMITER $$
+CREATE TRIGGER trg_order_completed_summary
+    AFTER UPDATE ON orders
+    FOR EACH ROW
+BEGIN
+    DECLARE v_date DATE;
+
+    -- Hanya proses saat status baru jadi 'completed'
+    IF NEW.status = 'completed' AND OLD.status != 'completed'
+       AND NEW.driver_id IS NOT NULL THEN
+
+        SET v_date = DATE(NEW.completed_at);
+
+        -- Platform fee 20% (sesuaikan konstanta ini)
+        SET @gross    = COALESCE(NEW.fare_final, NEW.fare_estimate);
+        SET @platform = FLOOR(@gross * 0.20);
+        SET @net      = @gross - @platform;
+        SET @dist     = COALESCE(NEW.distance_km, 0);
+
+        INSERT INTO driver_daily_summary
+            (driver_id, summary_date,
+             total_orders, gross_earnings, platform_fee, net_earnings, distance_km)
+        VALUES
+            (NEW.driver_id, v_date,
+             1, @gross, @platform, @net, @dist)
+        ON DUPLICATE KEY UPDATE
+            total_orders   = total_orders + 1,
+            gross_earnings = gross_earnings + @gross,
+            platform_fee   = platform_fee  + @platform,
+            net_earnings   = net_earnings  + @net,
+            distance_km    = distance_km   + @dist;
+    END IF;
+END$$
+DELIMITER ;
+
+
+-- ============================================================
+-- TRIGGER: upsert summary saat order cancelled
+-- ============================================================
+
+DROP TRIGGER IF EXISTS trg_order_cancelled_summary;
+DELIMITER $$
+CREATE TRIGGER trg_order_cancelled_summary
+    AFTER UPDATE ON orders
+    FOR EACH ROW
+BEGIN
+    IF NEW.status = 'cancelled' AND OLD.status != 'cancelled'
+       AND NEW.driver_id IS NOT NULL THEN
+
+        INSERT INTO driver_daily_summary
+            (driver_id, summary_date, cancelled_orders)
+        VALUES
+            (NEW.driver_id, DATE(NEW.cancelled_at), 1)
+        ON DUPLICATE KEY UPDATE
+            cancelled_orders = cancelled_orders + 1;
+    END IF;
+END$$
+DELIMITER ;
+
+
+-- ============================================================
+-- TRIGGER: update rating di summary saat rating masuk
+-- ============================================================
+-- ratings.poster_id = rider, ratings.target_id = driver
+
+DROP TRIGGER IF EXISTS trg_rating_driver_summary;
+DELIMITER $$
+CREATE TRIGGER trg_rating_driver_summary
+    AFTER INSERT ON ratings
+    FOR EACH ROW
+BEGIN
+    DECLARE v_driver_role VARCHAR(10);
+    DECLARE v_date DATE;
+
+    -- Pastikan target adalah driver
+    SELECT role INTO v_driver_role FROM users WHERE id = NEW.target_id;
+
+    IF v_driver_role = 'driver' THEN
+        -- Ambil tanggal dari order terkait (bukan CURDATE(), bisa rating H+1)
+        SELECT DATE(completed_at) INTO v_date
+        FROM orders WHERE id = NEW.order_id;
+
+        INSERT INTO driver_daily_summary
+            (driver_id, summary_date,
+             rating_sum, rating_count, avg_rating, tips)
+        VALUES
+            (NEW.target_id, v_date,
+             NEW.score, 1,
+             NEW.score,          -- avg awal = score itu sendiri
+             NEW.tip_amount)
+        ON DUPLICATE KEY UPDATE
+            rating_sum   = rating_sum + NEW.score,
+            rating_count = rating_count + 1,
+            avg_rating   = (rating_sum + NEW.score) / (rating_count + 1),
+            tips         = tips + NEW.tip_amount;
+    END IF;
+END$$
+DELIMITER ;
+
+
+-- ============================================================
+-- STORED PROCEDURE: update online_minutes + peak_hour
+-- Dipanggil dari Rust saat driver go offline
+-- Parameter: p_driver_id, p_minutes (durasi online session ini)
+-- ============================================================
+
+DROP PROCEDURE IF EXISTS sp_update_online_minutes;
+DELIMITER $$
+CREATE PROCEDURE sp_update_online_minutes(
+    IN p_driver_id  VARCHAR(36),
+    IN p_minutes    SMALLINT UNSIGNED
+)
+BEGIN
+    DECLARE v_date DATE DEFAULT CURDATE();
+
+    INSERT INTO driver_daily_summary
+        (driver_id, summary_date, online_minutes)
+    VALUES
+        (p_driver_id, v_date, p_minutes)
+    ON DUPLICATE KEY UPDATE
+        online_minutes = online_minutes + p_minutes;
+
+    -- Peak hour sederhana: jam dengan order terbanyak hari ini
+    -- Update hanya kalau ada data cukup (>= 2 order)
+    UPDATE driver_daily_summary dds
+    JOIN (
+        SELECT
+            driver_id,
+            DATE(completed_at)                          AS ord_date,
+            CONCAT(
+                LPAD(HOUR(completed_at), 2, '0'), ':00-',
+                LPAD(HOUR(completed_at) + 1, 2, '0'), ':00'
+            )                                           AS hour_slot,
+            COUNT(*)                                    AS cnt
+        FROM orders
+        WHERE driver_id  = p_driver_id
+          AND DATE(completed_at) = v_date
+          AND status = 'completed'
+        GROUP BY hour_slot
+        ORDER BY cnt DESC
+        LIMIT 1
+    ) AS ph ON ph.driver_id = dds.driver_id
+           AND ph.ord_date  = dds.summary_date
+    SET dds.peak_hour = ph.hour_slot
+    WHERE dds.driver_id    = p_driver_id
+      AND dds.summary_date = v_date
+      AND dds.total_orders >= 2;
+END$$
+DELIMITER ;
+
+
+-- ============================================================
+-- VIEW: driver_today_summary
+-- Shortcut untuk query hari ini tanpa pass parameter tanggal
+-- ============================================================
+
+CREATE OR REPLACE VIEW driver_today_summary AS
+    SELECT
+        dds.*,
+        u.name          AS driver_name,
+        dp.vehicle_type,
+        dp.vehicle_plate
+    FROM driver_daily_summary dds
+    JOIN users           u  ON u.id      = dds.driver_id
+    JOIN driver_profiles dp ON dp.user_id = dds.driver_id
+    WHERE dds.summary_date = CURDATE();
+
+
+-- ============================================================
+-- Backfill: isi summary dari data orders yang sudah ada
+-- Jalankan sekali setelah migration ini, opsional
+-- ============================================================
+
+INSERT INTO driver_daily_summary
+    (driver_id, summary_date,
+     total_orders, gross_earnings, platform_fee, net_earnings, distance_km)
+SELECT
+    o.driver_id,
+    DATE(o.completed_at)                    AS summary_date,
+    COUNT(*)                                AS total_orders,
+    SUM(COALESCE(o.fare_final, o.fare_estimate)) AS gross_earnings,
+    FLOOR(SUM(COALESCE(o.fare_final, o.fare_estimate)) * 0.20) AS platform_fee,
+    SUM(COALESCE(o.fare_final, o.fare_estimate))
+        - FLOOR(SUM(COALESCE(o.fare_final, o.fare_estimate)) * 0.20) AS net_earnings,
+    SUM(COALESCE(o.distance_km, 0))         AS distance_km
+FROM orders o
+WHERE o.status     = 'completed'
+  AND o.driver_id IS NOT NULL
+GROUP BY o.driver_id, DATE(o.completed_at)
+ON DUPLICATE KEY UPDATE
+    total_orders   = VALUES(total_orders),
+    gross_earnings = VALUES(gross_earnings),
+    platform_fee   = VALUES(platform_fee),
+    net_earnings   = VALUES(net_earnings),
+    distance_km    = VALUES(distance_km);
+
+
+-- Backfill ratings
+INSERT INTO driver_daily_summary
+    (driver_id, summary_date, rating_sum, rating_count, avg_rating, tips)
+SELECT
+    r.target_id                         AS driver_id,
+    DATE(o.completed_at)                AS summary_date,
+    SUM(r.score)                        AS rating_sum,
+    COUNT(*)                            AS rating_count,
+    AVG(r.score)                        AS avg_rating,
+    SUM(r.tip_amount)                   AS tips
+FROM ratings r
+JOIN orders  o ON o.id = r.order_id
+JOIN users   u ON u.id = r.target_id AND u.role = 'driver'
+GROUP BY r.target_id, DATE(o.completed_at)
+ON DUPLICATE KEY UPDATE
+    rating_sum   = VALUES(rating_sum),
+    rating_count = VALUES(rating_count),
+    avg_rating   = VALUES(avg_rating),
+    tips         = VALUES(tips);
