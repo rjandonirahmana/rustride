@@ -38,6 +38,7 @@ jobs:
             docker rm rust-app || true
             docker run -d \
               --name rust-app \
+              --runtime=youki \
               -p 50051:50051 \
               -e DATABASE_URL="${{ secrets.DATABASE_URL }}" \
               -e REDIS_URL="${{ secrets.REDIS_URL }}" \
