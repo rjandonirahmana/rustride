@@ -12,6 +12,7 @@ mod proto;
 mod repository;
 mod service;
 mod state;
+mod utils;
 
 use auth::JwtService;
 use grpc::{auth::AuthServiceImpl, trip::TripServiceImpl};

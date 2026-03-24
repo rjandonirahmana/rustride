@@ -8,14 +8,14 @@ use crate::{
         notification_service_server::NotificationService as NotificationServiceGrpc,
         GetNotificationsReq, MarkNotifReadReq, NotificationsEvent,
     },
-    repository::notification::NotificationRepositorytrait,
+    repository::notification::NotificationRepositoryTrait,
     service::notification::NotificationService,
 };
 
 // google.protobuf.Empty → pakai () di tonic
 type Empty = ();
 
-pub struct NotificationServiceImpl<NR: NotificationRepositorytrait> {
+pub struct NotificationServiceImpl<NR: NotificationRepositoryTrait> {
     pub notif_svc: Arc<NotificationService<NR>>,
     pub jwt: JwtService,
 }
@@ -30,7 +30,7 @@ fn verify(jwt: &JwtService, meta: &tonic::metadata::MetadataMap) -> Result<Strin
 }
 
 #[tonic::async_trait]
-impl<NR: NotificationRepositorytrait + 'static> NotificationServiceGrpc
+impl<NR: NotificationRepositoryTrait + 'static> NotificationServiceGrpc
     for NotificationServiceImpl<NR>
 {
     // ── GetNotifications ──────────────────────────────────────────────────────

@@ -7,7 +7,7 @@ use crate::{
         RideshareStatusEvent, ServerEvent,
     },
     repository::{
-        notification::NotificationRepositorytrait,
+        notification::NotificationRepositoryTrait,
         rideshare::{RideshareOpenItem, RideshareRepositoryTrait},
         user::UserRepository,
     },
@@ -62,7 +62,7 @@ fn is_route_compatible(
 
 pub struct RideshareService<
     RR: RideshareRepositoryTrait,
-    NR: NotificationRepositorytrait,
+    NR: NotificationRepositoryTrait,
     UR: UserRepository,
 > {
     pub rideshare_repo: Arc<RR>,
@@ -74,7 +74,7 @@ pub struct RideshareService<
 impl<RR, NR, UR> RideshareService<RR, NR, UR>
 where
     RR: RideshareRepositoryTrait + 'static,
-    NR: NotificationRepositorytrait + 'static,
+    NR: NotificationRepositoryTrait + 'static,
     UR: UserRepository + 'static,
 {
     // ── Driver: buka trip nebeng ──────────────────────────────────────────────

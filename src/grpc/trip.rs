@@ -10,10 +10,6 @@ use crate::{
     location::LocationService,
     models::order::Order as ordermodels,
     proto::{
-        message::{
-            ConversationItems, GetUploadUrlRes, HistoryEvent, NewMessageEvent, SendMediaResponse,
-        },
-        notification::NotificationsEvent,
         order::{ActiveOrderEvent, DriverInfo, Order},
         ridehailing::{
             app_service_server::AppService, client_event::Payload as Cp,
@@ -25,7 +21,7 @@ use crate::{
         },
     },
     repository::{
-        notification::NotificationRepositorytrait, order::OrderRepository,
+        notification::NotificationRepositoryTrait, order::OrderRepository,
         rideshare::RideshareRepositoryTrait, user::UserRepository,
     },
     service::{
@@ -42,7 +38,7 @@ pub struct TripServiceImpl<
     OR: OrderRepository,
     UR: UserRepository,
     RR: RideshareRepositoryTrait,
-    NR: NotificationRepositorytrait,
+    NR: NotificationRepositoryTrait,
 > {
     pub jwt: JwtService,
     pub order_svc: Arc<OrderService<OR, UR>>,
@@ -75,7 +71,7 @@ where
     OR: OrderRepository + 'static,
     UR: UserRepository + 'static,
     RR: RideshareRepositoryTrait + 'static,
-    NR: NotificationRepositorytrait + 'static,
+    NR: NotificationRepositoryTrait + 'static,
 {
     type StreamStream = EventStream;
 
@@ -319,7 +315,7 @@ async fn dispatch<OR, UR, RR, NR>(
     OR: OrderRepository + 'static,
     UR: UserRepository + 'static,
     RR: RideshareRepositoryTrait + 'static,
-    NR: NotificationRepositorytrait + 'static,
+    NR: NotificationRepositoryTrait + 'static,
 {
     let payload = match event.payload {
         Some(p) => p,

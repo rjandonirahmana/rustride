@@ -4,15 +4,15 @@ use crate::{
     connections::{ConnectionManager, Priority},
     proto::notification::{NewNotificationEvent, NotificationItem, NotificationsEvent},
     proto::ridehailing::{server_event::Payload as Sp, ServerEvent},
-    repository::notification::NotificationRepositorytrait,
+    repository::notification::NotificationRepositoryTrait,
 };
 
-pub struct NotificationService<NR: NotificationRepositorytrait> {
+pub struct NotificationService<NR: NotificationRepositoryTrait> {
     pub notif_repo: Arc<NR>,
     pub connections: Arc<ConnectionManager>,
 }
 
-impl<NR: NotificationRepositorytrait + 'static> NotificationService<NR> {
+impl<NR: NotificationRepositoryTrait + 'static> NotificationService<NR> {
     /// Push notif realtime ke user (dan simpan ke DB sekaligus)
     pub async fn push(
         &self,

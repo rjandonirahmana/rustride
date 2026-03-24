@@ -1,14 +1,17 @@
 use anyhow::Result;
 use aws_sdk_s3::presigning::PresigningConfig;
-use std::{sync::Arc, time::Duration};
-use uuid::Uuid;
+use std::sync::Arc;
+use std::time::Duration;
 
 use crate::{
     connections::{ConnectionManager, Priority},
     models::message::Message,
-    proto::message::{ConversationItem, NewMessageEvent},
-    proto::ridehailing::{server_event::Payload as Sp, ReadReceiptEvent, ServerEvent},
+    proto::{
+        message::{ConversationItem, NewMessageEvent},
+        ridehailing::{server_event::Payload as Sp, ReadReceiptEvent, ServerEvent},
+    },
     repository::message::MessageRepository,
+    utils::ulid::{mime_to_type, new_ulid},
 };
 
 #[derive(Clone)]
@@ -35,7 +38,7 @@ impl ChatService {
         }
 
         let mut msg = Message {
-            id: Uuid::new_v4().to_string(),
+            id: new_ulid(),
             sender_id: sender_id.to_string(),
             recipient_id: recipient_id.to_string(),
             content: content.to_string(),
@@ -76,16 +79,14 @@ impl ChatService {
             anyhow::bail!("Tidak bisa kirim ke diri sendiri");
         }
 
-        // 🔐 VALIDASI URL (WAJIB)
         if !media_url.contains(".r2.cloudflarestorage.com") && !media_url.contains("r2.dev") {
             anyhow::bail!("Invalid media URL");
         }
 
-        // ✅ tentukan type dari mime
         let msg_type = mime_to_type(media_mime);
 
         let mut msg = Message {
-            id: uuid::Uuid::new_v4().to_string(),
+            id: new_ulid(),
             sender_id: sender_id.to_string(),
             recipient_id: recipient_id.to_string(),
             content: "".to_string(),
@@ -107,18 +108,12 @@ impl ChatService {
         };
 
         self.msg_repo.save(&mut msg).await?;
-
-        // 🔥 push ke recipient
         self.push_message(&msg, sender).await;
 
         Ok(msg)
     }
 
-    pub async fn get_upload_url(
-        &self,
-        user_id: &str,
-        mime: &str,
-    ) -> anyhow::Result<(String, String)> {
+    pub async fn get_upload_url(&self, user_id: &str, mime: &str) -> Result<(String, String)> {
         let ext = match mime {
             "image/jpeg" => "jpg",
             "image/png" => "png",
@@ -127,25 +122,21 @@ impl ChatService {
             _ => "bin",
         };
 
-        let file_id = Uuid::new_v4().to_string();
+        // ULID string langsung dipakai di path — sortable by time, URL-safe
+        let file_id = new_ulid();
         let key = format!("chat/{}/{}.{}", user_id, file_id, ext);
 
-        // 1. Generate Presigned URL untuk Client Upload
         let presigned = self
             .s3_client
             .put_object()
-            .bucket(self.r2_bucket) // Pastikan nama bucket sesuai di dashboard R2
+            .bucket(self.r2_bucket)
             .key(&key)
             .content_type(mime)
             .presigned(PresigningConfig::expires_in(Duration::from_secs(300))?)
             .await?;
 
         let upload_url = presigned.uri().to_string();
-
-        // 2. Gunakan URL Publik R2 Anda (Custom Domain atau r2.dev)
-        // Jangan gunakan IP Contabo jika file disimpan di Cloudflare R2
         let public_url = format!("{}{}", self.r2_public_url, key);
-        // ATAU: format!("https://media.domainanda.com{}", key);
 
         Ok((upload_url, public_url))
     }
@@ -158,7 +149,6 @@ impl ChatService {
     pub async fn mark_read(&self, reader_id: &str, sender_id: &str) -> Result<()> {
         self.msg_repo.mark_read(reader_id, sender_id).await?;
 
-        // Notify sender bahwa pesannya sudah dibaca
         let read_at = chrono::Utc::now()
             .format("%Y-%m-%d %H:%M:%S%.3f")
             .to_string();
@@ -184,12 +174,9 @@ impl ChatService {
         before: Option<&str>,
     ) -> Result<Vec<Message>> {
         let limit = if limit <= 0 || limit > 100 { 50 } else { limit };
-        let msgs = self
-            .msg_repo
+        self.msg_repo
             .get_history(user_id, peer_id, limit, before)
-            .await?;
-
-        Ok(msgs)
+            .await
     }
 
     // ── Internal ──────────────────────────────────────────────────────────────
@@ -214,32 +201,14 @@ impl ChatService {
             })),
         };
 
-        // Push ke recipient
         self.connections.send(
             &msg.recipient_id,
             Arc::new(event.clone()),
             Priority::Critical,
         );
 
-        // Mark delivered kalau recipient online
         if self.connections.is_connected(&msg.recipient_id).await {
             let _ = self.msg_repo.mark_delivered(&msg.id).await;
         }
-    }
-}
-
-fn detect_mime(bytes: &[u8]) -> Option<&'static str> {
-    infer::get(bytes).map(|kind| kind.mime_type())
-}
-
-fn mime_to_type(mime: &str) -> &'static str {
-    if mime.starts_with("image/") {
-        "image"
-    } else if mime.starts_with("video/") {
-        "video"
-    } else if mime.starts_with("audio/") {
-        "audio"
-    } else {
-        "file"
     }
 }
