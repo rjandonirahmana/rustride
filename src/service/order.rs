@@ -519,7 +519,7 @@ where
             Arc::new(ServerEvent {
                 payload: Some(Sp::OrderStatus(OrderStatusEvent {
                     order_id: order_id.to_string(),
-                    status: "driver_found".to_string(),
+                    status: "driver_accepted".to_string(),
                     driver: driver_info.clone(),
                     service_type: order.service_type.clone(),
                     fare_estimate: order.fare_estimate,

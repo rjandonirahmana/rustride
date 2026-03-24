@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use mysql_async::{from_value, prelude::Queryable, Pool, Row};
 
 use super::db::{col, exec_rows};
-use crate::utils::ulid::ulid_to_bytes;
+use crate::{repository::db::f32_col, utils::ulid::ulid_to_bytes};
 
 // ── Models ────────────────────────────────────────────────────────────────────
 
@@ -163,10 +163,7 @@ impl MySqlDriverRepository {
             rider_name: from_value(col(row, "rider_name")?),
             pickup_address: from_value(col(row, "pickup_address")?),
             dest_address: from_value(col(row, "dest_address")?),
-            distance_km: {
-                let v: f64 = from_value(col(row, "distance_km")?);
-                v as f32
-            },
+            distance_km: f32_col(row, "distance_km")?,
             duration_min: from_value(col(row, "duration_min")?),
             fare: from_value(col(row, "fare")?),
             driver_earning: from_value(col(row, "driver_earning")?),
@@ -175,10 +172,7 @@ impl MySqlDriverRepository {
             started_at: from_value(col(row, "started_at")?),
             completed_at: from_value(col(row, "completed_at")?),
             cancel_reason: from_value(col(row, "cancel_reason")?),
-            rating: {
-                let v: f64 = from_value(col(row, "rating")?);
-                v as f32
-            },
+            rating: f32_col(row, "rating")?,
             rating_comment: from_value(col(row, "rating_comment")?),
         })
     }
@@ -241,14 +235,8 @@ impl DriverRepository for MySqlDriverRepository {
             net_earnings: from_value(col(&r, "net_earnings")?),
             tips: from_value(col(&r, "tips")?),
             online_minutes: from_value(col(&r, "online_minutes")?),
-            distance_km: {
-                let v: f64 = from_value(col(&r, "distance_km")?);
-                v as f32
-            },
-            avg_rating: {
-                let v: f64 = from_value(col(&r, "avg_rating")?);
-                v as f32
-            },
+            distance_km: f32_col(&r, "distance_km")?,
+            avg_rating: f32_col(&r, "avg_rating")?,
             peak_hour: from_value(col(&r, "peak_hour")?),
         }))
     }
@@ -346,10 +334,7 @@ impl DriverRepository for MySqlDriverRepository {
             dest_lng: from_value(col(&r, "dest_lng")?),
             rider_phone: from_value(col(&r, "rider_phone")?),
             rider_avatar: from_value(col(&r, "rider_avatar")?),
-            rider_rating: {
-                let v: f64 = from_value(col(&r, "rider_rating")?);
-                v as f32
-            },
+            rider_rating: f32_col(&r, "rider_rating")?,
         }))
     }
 
@@ -393,10 +378,7 @@ impl DriverRepository for MySqlDriverRepository {
                     from_value::<i64>(col(&r, "tips")?),
                     from_value::<i32>(col(&r, "trip_count")?),
                     from_value::<i32>(col(&r, "cancel_count")?),
-                    {
-                        let v: f64 = from_value(col(&r, "distance_km")?);
-                        v as f32
-                    },
+                    f32_col(&r, "distance_km")?,
                 ),
                 None => (0, 0, 0, 0, 0, 0.0),
             };
@@ -429,13 +411,20 @@ impl DriverRepository for MySqlDriverRepository {
             .iter()
             .map(|r| -> Result<DailyEarningRow> {
                 Ok(DailyEarningRow {
-                    date: from_value::<String>(col(r, "date")?.clone()),
+                    date: {
+                        let val = col(r, "date")?.clone();
+                        // mysql_async Date type tidak bisa langsung ke String
+                        // convert via chrono NaiveDate atau manual
+                        match val {
+                            mysql_async::Value::Date(y, m, d, ..) => {
+                                format!("{:04}-{:02}-{:02}", y, m, d)
+                            }
+                            _ => from_value::<String>(val),
+                        }
+                    },
                     net_earnings: from_value(col(r, "net_earnings")?),
                     trip_count: from_value::<i64>(col(r, "trip_count")?) as i32,
-                    distance_km: {
-                        let v: f64 = from_value(col(r, "distance_km")?);
-                        v as f32
-                    },
+                    distance_km: f32_col(r, "distance_km")?,
                 })
             })
             .collect::<Result<_>>()?;

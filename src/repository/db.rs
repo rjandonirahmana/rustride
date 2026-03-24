@@ -103,3 +103,12 @@ pub async fn exec_first<P: Into<Params> + Send>(
 pub fn col_opt_i64(row: &Row, name: &str) -> Option<i64> {
     row.get::<Option<i64>, _>(name).unwrap_or(None)
 }
+
+pub fn f32_col(row: &Row, name: &str) -> Result<f32> {
+    let val = col(row, name)?;
+    // Coba f64 dulu, fallback ke i64 lalu cast
+    let v: f64 = mysql_async::from_value_opt(val.clone())
+        .or_else(|_| mysql_async::from_value_opt::<i64>(val).map(|i| i as f64))
+        .map_err(|e| anyhow::anyhow!("f32_col '{}': {}", name, e))?;
+    Ok(v as f32)
+}
