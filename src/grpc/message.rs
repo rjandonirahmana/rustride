@@ -99,10 +99,7 @@ impl<OR: OrderRepository + 'static> MessageService for MessageServiceImpl<OR> {
             return Err(Status::invalid_argument("media_url kosong"));
         }
 
-        if !m
-            .media_url
-            .starts_with("http://vmi3152926.contaboserver.net/rustride/")
-        {
+        if !m.media_url.contains("r2.dev") {
             return Err(Status::invalid_argument("URL tidak valid"));
         }
 
