@@ -136,7 +136,7 @@ impl ChatService {
             .await?;
 
         let upload_url = presigned.uri().to_string();
-        let public_url = format!("{}{}", self.r2_public_url, key);
+        let public_url = format!("{}/{}", self.r2_public_url, key);
 
         Ok((upload_url, public_url))
     }
