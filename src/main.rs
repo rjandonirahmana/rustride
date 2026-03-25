@@ -1,4 +1,4 @@
-use aws_config::{meta::region::RegionProviderChain, BehaviorVersion, Region};
+use aws_config::BehaviorVersion;
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 

@@ -50,5 +50,5 @@ jobs:
               -e R2_PUBLIC_URL="${{ secrets.R2_PUBLIC_URL }}" \
               -e WAHA_BASE_URL="${{ secrets.WAHA_BASE_URL }}" \
               -e WAHA_SESSION="${{ secrets.WAHA_SESSION }}" \
-              -e WAHA_API_KEY="${{ secrets.WAHA_API_KEY}}"
+              -e WAHA_API_KEY="${{ secrets.WAHA_API_KEY}}" \
               ${{ secrets.DOCKERHUB_USERNAME }}/rust-app:latest
