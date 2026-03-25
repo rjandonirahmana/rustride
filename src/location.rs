@@ -203,29 +203,63 @@ impl LocationService {
     ) -> Result<Vec<(String, f64)>> {
         Self::validate_coords(lat, lng)?;
 
-        let candidates = self
+        let mut redis = self.redis.clone();
+
+        // 1. Try normal radius
+        let mut candidates = self
             .geosearch_candidates(lat, lng, service_type, SEARCH_RADIUS_KM)
             .await?;
 
-        // Expand radius jika kandidat terlalu sedikit
-        let candidates = if candidates.len() < MIN_DRIVERS {
-            tracing::debug!(
-                "Only {} candidates at {}km, expanding to {}km",
-                candidates.len(),
-                SEARCH_RADIUS_KM,
-                SEARCH_RADIUS_EXPAND_KM
-            );
-            self.geosearch_candidates(lat, lng, service_type, SEARCH_RADIUS_EXPAND_KM)
-                .await?
-        } else {
-            candidates
-        };
+        // 2. Expand jika kurang
+        if candidates.len() < MIN_DRIVERS {
+            candidates = self
+                .geosearch_candidates(lat, lng, service_type, SEARCH_RADIUS_EXPAND_KM)
+                .await?;
+        }
 
         if candidates.is_empty() {
             return Ok(vec![]);
         }
 
-        self.filter_available(candidates).await
+        // 3. Batch MGET loc (cek online)
+        let loc_keys: Vec<String> = candidates.iter().map(|(id, _)| Self::loc_key(id)).collect();
+
+        let loc_data: Vec<Option<Vec<u8>>> = redis::cmd("MGET")
+            .arg(&loc_keys)
+            .query_async(&mut redis)
+            .await
+            .unwrap_or_else(|_| vec![None; candidates.len()]);
+
+        // 4. Pipeline EXISTS order (cek busy)
+        let mut pipe = redis::pipe();
+        for (id, _) in &candidates {
+            pipe.cmd("EXISTS").arg(Self::order_key(id));
+        }
+
+        let order_exists: Vec<i64> = pipe
+            .query_async(&mut redis)
+            .await
+            .unwrap_or_else(|_| vec![0; candidates.len()]);
+
+        // 5. Filter + limit
+        let mut result = Vec::with_capacity(MAX_DRIVERS);
+
+        for i in 0..candidates.len() {
+            let (ref driver_id, dist_m) = candidates[i];
+
+            let is_online = loc_data.get(i).and_then(|v| v.as_ref()).is_some();
+            let has_order = order_exists.get(i).copied().unwrap_or(0) == 1;
+
+            if is_online && !has_order {
+                result.push((driver_id.clone(), dist_m));
+            }
+
+            if result.len() >= MAX_DRIVERS {
+                break;
+            }
+        }
+
+        Ok(result)
     }
 
     /// GEOSEARCH helper — reusable untuk radius normal dan expand

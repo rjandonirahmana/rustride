@@ -112,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
         user_repo.clone(),
         order_repo.clone(),
         location,
-        redis_conn,
+        redis_conn.clone(),
         redis_client.clone(),
     );
 
@@ -144,7 +144,7 @@ async fn main() -> anyhow::Result<()> {
             user_repo: user_repo.clone(),
             jwt: jwt.clone(),
             waha: waha,
-            redis: redis_client.get_multiplexed_async_connection().await?,
+            redis: redis_conn,
         }))
         .add_service(MessageServiceServer::new(MessageServiceImpl {
             chat_svc: Arc::new(service_chat.clone()),

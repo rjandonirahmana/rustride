@@ -2,8 +2,18 @@ syntax = "proto3";
 package auth;
 
 service AuthService {
-  rpc Register(RegisterRequest) returns (AuthResponse);
+  rpc Register(RegisterRequest) returns (Empty);
   rpc Login(LoginRequest)       returns (AuthResponse);
+  rpc VerificationRegist(VerificationRegister)       returns (AuthResponse);
+}
+
+
+message Empty {}
+
+
+message VerificationRegister {
+  string otp         = 1;
+  string phone         = 2;
 }
 
 message RegisterRequest {

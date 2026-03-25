@@ -1,8 +1,8 @@
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use bcrypt::{hash, verify, DEFAULT_COST};
 use prost::Message;
 use rand::{rngs::StdRng, Rng, SeedableRng};
-use redis::AsyncCommands;
+use redis::{aio::ConnectionManager, AsyncCommands};
 use reqwest::Client as HttpClient;
 use serde_json::json;
 use std::sync::Arc;
@@ -16,6 +16,8 @@ use crate::{
     repository::user::UserRepository,
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+
 pub struct AuthResponse {
     pub token: String,
     pub user: User,
@@ -24,30 +26,33 @@ pub struct AuthResponse {
 pub struct AuthService<R: UserRepository> {
     pub repo: Arc<R>,
     pub jwt: JwtService,
-    pub redis: redis::aio::MultiplexedConnection,
+    pub redis: ConnectionManager,
     pub http: HttpClient,
-    pub waha: WahaConfig,
+    pub waha: Arc<WahaConfig>,
 }
 
 impl<R: UserRepository> AuthService<R> {
     pub fn new(
         repo: Arc<R>,
         jwt: JwtService,
-        redis: redis::aio::MultiplexedConnection,
-        waha: WahaConfig,
+        redis: ConnectionManager,
+        http: HttpClient,
+        waha: Arc<WahaConfig>,
     ) -> Self {
         Self {
             repo,
             jwt,
             redis,
-            http: HttpClient::new(),
+            http,
             waha,
         }
     }
 
+    // ── REGISTER INIT ─────────────────────────────────────────────────────────
+
     pub async fn initiate_register(&mut self, req: RegisterRequest) -> Result<()> {
         if req.role != "rider" && req.role != "driver" {
-            bail!("Role tidak valid: harus 'rider' atau 'driver'");
+            bail!("Role harus 'rider' atau 'driver'");
         }
 
         if self.repo.find_by_phone(&req.phone).await?.is_some() {
@@ -56,9 +61,9 @@ impl<R: UserRepository> AuthService<R> {
 
         let redis_key = format!("reg:{}", req.phone);
 
-        let existing: Option<Vec<u8>> = self.redis.get(&redis_key).await?;
-        if existing.is_some() {
-            let ttl: i64 = self.redis.ttl(&redis_key).await?;
+        // Rate limit OTP
+        if let Ok(Some(_)) = self.redis.get::<_, Option<Vec<u8>>>(&redis_key).await {
+            let ttl: i64 = self.redis.ttl(&redis_key).await.unwrap_or(0);
             if ttl > 540 {
                 bail!("OTP sudah dikirim. Tunggu {} detik lagi.", ttl - 540);
             }
@@ -67,7 +72,6 @@ impl<R: UserRepository> AuthService<R> {
         let mut rng = StdRng::from_os_rng();
         let otp = format!("{:06}", rng.random_range(100_000..=999_999));
 
-        // Sesuai urutan field proto PendingUser (1-10)
         let pending = PendingUser {
             name: req.name.clone(),
             phone: req.phone.clone(),
@@ -88,23 +92,21 @@ impl<R: UserRepository> AuthService<R> {
 
         self.send_wa_otp(&req.phone, &otp).await?;
 
-        info!(phone = %req.phone, "OTP initiated and stored in Redis");
+        info!(phone = %req.phone, "OTP stored & sent");
         Ok(())
     }
+
+    // ── VERIFY REGISTER ───────────────────────────────────────────────────────
 
     pub async fn verify_register(&mut self, phone: &str, otp_input: &str) -> Result<AuthResponse> {
         let redis_key = format!("reg:{}", phone);
 
         let bytes: Option<Vec<u8>> = self.redis.get(&redis_key).await?;
-        let bytes = match bytes {
-            Some(b) => b,
-            None => {
-                bail!("Sesi registrasi tidak ditemukan atau sudah expired. Silakan daftar ulang.")
-            }
-        };
+        let bytes =
+            bytes.ok_or_else(|| anyhow!("Sesi registrasi tidak ditemukan atau sudah expired"))?;
 
         let pending = PendingUser::decode(bytes.as_slice())
-            .map_err(|e| anyhow::anyhow!("Gagal decode pending user: {e}"))?;
+            .map_err(|e| anyhow!("Decode pending user gagal: {e}"))?;
 
         if !constant_time_eq(&pending.otp, otp_input) {
             bail!("Kode OTP salah");
@@ -114,14 +116,12 @@ impl<R: UserRepository> AuthService<R> {
 
         let hashed = hash(&pending.password, DEFAULT_COST)?;
 
-        // RegisterRequest.email adalah String (bukan Option), langsung assign
         let req = RegisterRequest {
             name: pending.name,
             phone: pending.phone,
             email: pending.email,
             password: pending.password,
             role: pending.role,
-            // optional fields dari PendingUser proto sudah Option<String>
             vehicle_type: pending.vehicle_type,
             vehicle_plate: pending.vehicle_plate,
             vehicle_model: pending.vehicle_model,
@@ -134,16 +134,19 @@ impl<R: UserRepository> AuthService<R> {
             .jwt
             .sign(&user.id, &user.name, &user.role, &user.vehicle_type)?;
 
-        tracing::info!("[Auth] User {} berhasil registrasi dan masuk DB", user.id);
+        info!(user_id = %user.id, "User registered");
+
         Ok(AuthResponse { token, user })
     }
+
+    // ── LOGIN ─────────────────────────────────────────────────────────────────
 
     pub async fn login(&self, phone: &str, password: &str) -> Result<AuthResponse> {
         let user = self
             .repo
             .find_by_phone(phone)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("Nomor HP tidak ditemukan"))?;
+            .ok_or_else(|| anyhow!("Nomor HP tidak ditemukan"))?;
 
         if !verify(password, &user.password)? {
             bail!("Password salah");
@@ -152,8 +155,11 @@ impl<R: UserRepository> AuthService<R> {
         let token = self
             .jwt
             .sign(&user.id, &user.name, &user.role, &user.vehicle_type)?;
+
         Ok(AuthResponse { token, user })
     }
+
+    // ── WA OTP ────────────────────────────────────────────────────────────────
 
     async fn send_wa_otp(&self, phone: &str, otp: &str) -> Result<()> {
         let normalized = normalize_phone(phone);
@@ -169,26 +175,30 @@ impl<R: UserRepository> AuthService<R> {
 
         let url = format!("{}/api/sendText", self.waha.base_url);
 
-        // FIX: hapus type annotation () yang salah, res adalah reqwest::Response
-        let mut builder = self.http.post(&url).json(&body);
+        let mut req = self.http.post(&url).json(&body);
+
         if !self.waha.api_key.is_empty() {
-            builder = builder.header("X-Api-Key", &self.waha.api_key);
+            req = req.header("X-Api-Key", &self.waha.api_key);
         }
 
-        let res = builder.send().await?;
+        let res = req.send().await?;
+
         if !res.status().is_success() {
             let status = res.status();
             let text = res.text().await.unwrap_or_default();
             bail!("WAHA error {status}: {text}");
         }
 
-        tracing::info!("[Auth] WA OTP terkirim ke {normalized}");
+        info!("OTP sent to {}", normalized);
         Ok(())
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+
 fn normalize_phone(phone: &str) -> String {
     let digits: String = phone.chars().filter(|c| c.is_ascii_digit()).collect();
+
     let normalized = if digits.starts_with("08") {
         format!("62{}", &digits[1..])
     } else if digits.starts_with("62") {
@@ -196,6 +206,7 @@ fn normalize_phone(phone: &str) -> String {
     } else {
         digits
     };
+
     format!("{}@c.us", normalized)
 }
 
@@ -203,6 +214,7 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
     }
+
     a.bytes()
         .zip(b.bytes())
         .fold(0u8, |acc, (x, y)| acc | (x ^ y))
