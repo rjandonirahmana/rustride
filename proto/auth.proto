@@ -29,3 +29,17 @@ message AuthResponse {
   string role    = 3;
   string name    = 4;
 }
+
+
+message PendingUser {
+    string name = 1;
+    string phone = 2;
+    string email = 3;
+    string password = 4;
+    string role = 5;
+    string otp = 6;
+    optional string vehicle_type = 7;
+    optional string vehicle_plate = 8;
+    optional string vehicle_model = 9;
+    optional string vehicle_color = 10;
+}

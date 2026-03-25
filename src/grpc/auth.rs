@@ -1,11 +1,9 @@
-/// AuthServiceImpl — gRPC unary handler untuk Register & Login.
-///
-/// Tidak perlu JWT di header; ini endpoint publik.
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
 use crate::{
     auth::JwtService,
+    config::WahaConfig,
     models::user::RegisterRequest,
     proto::auth::{
         auth_service_server::AuthService, AuthResponse, LoginRequest,
@@ -18,17 +16,20 @@ use crate::{
 pub struct AuthServiceImpl<R: UserRepository> {
     pub user_repo: Arc<R>,
     pub jwt: JwtService,
+    pub redis: redis::aio::MultiplexedConnection,
+    pub waha: Arc<WahaConfig>,
 }
 
 #[tonic::async_trait]
 impl<R: UserRepository + 'static> AuthService for AuthServiceImpl<R> {
+    /// Step 1 register: kirim OTP via WA, return token kosong sebagai ACK.
+    /// Client harus lanjut panggil VerifyOtp (atau endpoint terpisah).
     async fn register(
         &self,
         req: Request<ProtoRegister>,
     ) -> Result<Response<AuthResponse>, Status> {
         let r = req.into_inner();
 
-        // Validasi sederhana
         if r.name.is_empty() || r.phone.is_empty() || r.password.is_empty() {
             return Err(Status::invalid_argument(
                 "name, phone, password wajib diisi",
@@ -37,8 +38,6 @@ impl<R: UserRepository + 'static> AuthService for AuthServiceImpl<R> {
         if r.role != "rider" && r.role != "driver" {
             return Err(Status::invalid_argument("role harus 'rider' atau 'driver'"));
         }
-
-        let svc = AuthSvc::new(self.user_repo.clone(), self.jwt.clone());
 
         let domain_req = RegisterRequest {
             name: r.name,
@@ -52,14 +51,28 @@ impl<R: UserRepository + 'static> AuthService for AuthServiceImpl<R> {
             vehicle_color: nonempty(r.vehicle_color),
         };
 
-        svc.register(domain_req)
+        // Buat svc per-request dengan clone redis connection
+        let mut svc = AuthSvc {
+            repo: self.user_repo.clone(),
+            jwt: self.jwt.clone(),
+            redis: self.redis.clone(),
+            http: reqwest::Client::new(),
+            waha: WahaConfig {
+                base_url: self.waha.base_url.clone(),
+                session: self.waha.session.clone(),
+                api_key: self.waha.api_key.clone(),
+            },
+        };
+
+        svc.initiate_register(domain_req)
             .await
-            .map(|res| {
+            .map(|_| {
+                // OTP terkirim — return ACK kosong, token diisi setelah verify
                 Response::new(AuthResponse {
-                    token: res.token,
-                    user_id: res.user.id,
-                    role: res.user.role,
-                    name: res.user.name,
+                    token: String::new(),
+                    user_id: String::new(),
+                    role: String::new(),
+                    name: String::new(),
                 })
             })
             .map_err(|e| Status::internal(e.to_string()))
@@ -67,11 +80,22 @@ impl<R: UserRepository + 'static> AuthService for AuthServiceImpl<R> {
 
     async fn login(&self, req: Request<LoginRequest>) -> Result<Response<AuthResponse>, Status> {
         let r = req.into_inner();
+
         if r.phone.is_empty() || r.password.is_empty() {
             return Err(Status::invalid_argument("phone dan password wajib diisi"));
         }
 
-        let svc = AuthSvc::new(self.user_repo.clone(), self.jwt.clone());
+        let svc = AuthSvc {
+            repo: self.user_repo.clone(),
+            jwt: self.jwt.clone(),
+            redis: self.redis.clone(),
+            http: reqwest::Client::new(),
+            waha: WahaConfig {
+                base_url: self.waha.base_url.clone(),
+                session: self.waha.session.clone(),
+                api_key: self.waha.api_key.clone(),
+            },
+        };
 
         svc.login(&r.phone, &r.password)
             .await

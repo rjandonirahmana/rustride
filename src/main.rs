@@ -21,6 +21,7 @@ use proto::ridehailing::app_service_server::AppServiceServer;
 use repository::{order::MySqlOrderRepository, user::MySqlUserRepository};
 
 use crate::{
+    config::WahaConfig,
     grpc::{
         driver::DriverServiceImpl, message::MessageServiceImpl,
         notification::NotificationServiceImpl, order::OrderServiceImpl,
@@ -112,7 +113,7 @@ async fn main() -> anyhow::Result<()> {
         order_repo.clone(),
         location,
         redis_conn,
-        redis_client,
+        redis_client.clone(),
     );
 
     // create a 'static str for r2_public_url by leaking a cloned String so it can live for the program lifetime
@@ -127,6 +128,12 @@ async fn main() -> anyhow::Result<()> {
 
     let driver_service = Arc::new(DriverService::new(driver_repo));
 
+    let waha = Arc::new(WahaConfig {
+        base_url: std::env::var("WAHA_BASE_URL")
+            .unwrap_or_else(|_| "http://localhost:3000".to_string()),
+        session: std::env::var("WAHA_SESSION").unwrap_or_else(|_| "default".to_string()),
+        api_key: std::env::var("WAHA_API_KEY").unwrap_or_default(), // kosong = tidak pakai auth
+    });
     // ── gRPC server ───────────────────────────────────────────────────────────
     let addr: std::net::SocketAddr = cfg.grpc_addr.parse()?;
     tracing::info!("gRPC listening on {}", addr);
@@ -136,6 +143,8 @@ async fn main() -> anyhow::Result<()> {
         .add_service(AuthServiceServer::new(AuthServiceImpl {
             user_repo: user_repo.clone(),
             jwt: jwt.clone(),
+            waha: waha,
+            redis: redis_client.get_multiplexed_async_connection().await?,
         }))
         .add_service(MessageServiceServer::new(MessageServiceImpl {
             chat_svc: Arc::new(service_chat.clone()),

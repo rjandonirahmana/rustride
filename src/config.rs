@@ -16,6 +16,13 @@ pub struct Config {
     pub r2_public_url: String,
 }
 
+#[derive(Clone)]
+pub struct WahaConfig {
+    pub base_url: String,
+    pub session: String,
+    pub api_key: String,
+}
+
 // Custom Debug implementation supaya tidak sengaja bocorin password di log produksi
 impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
