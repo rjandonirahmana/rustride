@@ -85,7 +85,11 @@ impl UserRepository for MySqlUserRepository {
                 &id_b[..],
                 req.name.as_str(),
                 req.phone.as_str(),
-                req.email.as_str(),
+                if req.email.as_str() == "" {
+                    None
+                } else {
+                    Some(req.email.as_str())
+                },
                 hashed,
                 req.role.as_str(),
             ),
