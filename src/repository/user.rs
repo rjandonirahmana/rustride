@@ -33,7 +33,7 @@ impl MySqlUserRepository {
     }
 
     fn user_cols() -> &'static str {
-        r#"u.id, u.name, u.phone, u.email, u.password, u.role, u.avatar_url,
+        r#"u.id, u.name, u.phone, IFNULL(u.email, '') as email, u.password, u.role, u.avatar_url,
            DATE_FORMAT(CONVERT_TZ(u.created_at,'+00:00','+00:00'),'%Y-%m-%dT%H:%i:%sZ') AS created_at_fmt,
            IFNULL(dp.vehicle_type, '') AS vehicle_type"#
     }
