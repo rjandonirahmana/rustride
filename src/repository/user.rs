@@ -17,7 +17,6 @@ pub trait UserRepository: Send + Sync {
     async fn find_by_phone(&self, phone: &str) -> Result<Option<User>>;
     async fn find_driver_by_id(&self, id: &str) -> Result<Option<(User, DriverProfile)>>;
     async fn find_drivers_by_ids(&self, ids: &[String]) -> Result<Vec<(User, DriverProfile)>>;
-    async fn set_driver_active(&self, driver_id: &str, active: bool) -> Result<()>;
 }
 
 // ── MySQL implementasi ────────────────────────────────────────────────────────
@@ -191,15 +190,5 @@ impl UserRepository for MySqlUserRepository {
         rows.into_iter()
             .map(|r| Ok((Self::row_to_user(&r)?, Self::row_to_driver_profile(&r)?)))
             .collect()
-    }
-
-    async fn set_driver_active(&self, driver_id: &str, active: bool) -> Result<()> {
-        let driver_b = ulid_to_bytes(driver_id)?;
-        exec_drop(
-            &self.pool,
-            "UPDATE driver_profiles SET is_active = ? WHERE user_id = ?",
-            (active as i8, &driver_b[..]),
-        )
-        .await
     }
 }

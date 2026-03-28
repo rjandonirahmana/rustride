@@ -157,8 +157,8 @@ impl OrderRepository for MySqlOrderRepository {
             .exec_first(
                 format!(
                     // IN lebih optimal dari NOT IN — cardinality jelas, optimizer bisa pakai idx_rider_status
-                    "SELECT {} FROM orders o JOIN users u ON o.rider_id = u.id
-                     WHERE o.rider_id = ? AND o.status IN ('driver_accepted','driver_arrived','on_trip')",
+                    "SELECT {} FROM orders o JOIN users u ON o.rider_id = u.id 
+                    WHERE o.rider_id = ? AND o.status NOT IN ('cancelled', 'completed')",
                     Self::order_cols()
                 ),
                 (&rider_b[..],),
@@ -174,7 +174,7 @@ impl OrderRepository for MySqlOrderRepository {
             .exec_first(
                 format!(
                     "SELECT {} FROM orders o JOIN users u ON o.rider_id = u.id
-                     WHERE o.driver_id = ? AND o.status IN ('driver_accepted','driver_arrived','on_trip')",
+                     WHERE o.driver_id = ? AND o.status NOT IN ('cancelled', 'completed')",
                     Self::order_cols()
                 ),
                 (&driver_b[..],),

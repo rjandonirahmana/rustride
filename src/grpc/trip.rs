@@ -100,10 +100,6 @@ where
         // ── Connect + notify ──────────────────────────────────────────────────
         let (event_rx, cancel_token) = self.connections.connect(&user_id, &role).await;
 
-        if role == "driver" {
-            let _ = self.user_repo.set_driver_active(&user_id, true).await;
-        }
-
         tracing::info!(user_id, role, vehicle_type, "user connected");
 
         self.connections.send(
@@ -206,7 +202,6 @@ where
             }
 
             if ctx.role == "driver" {
-                let _ = user_repo.set_driver_active(&ctx.user_id, false).await;
                 // Hapus dari kedua geo index menggunakan vehicle_type yang benar.
                 // Versi sebelumnya hardcode "motor" dan "mobil" — ini menyebabkan
                 // driver dengan vehicle_type lain tidak ter-remove dengan benar.
