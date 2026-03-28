@@ -5,7 +5,6 @@
 // futures = "0.3"
 
 use crate::proto::ridehailing::ServerEvent;
-use crate::proto::ridehailing::{server_event::Payload as Sp, ErrorEvent};
 use ahash::AHasher;
 use anyhow::Result;
 use dashmap::{DashMap, DashSet};
@@ -25,6 +24,7 @@ use tokio::sync::{
     Semaphore,
 };
 use tokio_util::sync::CancellationToken;
+use tonic::Status;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -332,6 +332,16 @@ impl ConnectionManager {
     ) {
         let (tx, rx) = mpsc::channel(CHANNEL_BUFFER);
         let key: Arc<str> = user_id.into();
+
+        // 🔥 cleanup existing connection (IMPORTANT)
+        if let Some((_, old_tx)) = self.channels.remove(&key) {
+            tracing::warn!(user_id, "Replacing existing connection");
+            self.drivers.remove(key.as_ref());
+            self.riders.remove(key.as_ref());
+
+            let _ = old_tx.try_send(Err(Status::cancelled("Replaced by new connection")));
+        }
+
         self.channels.insert(key.clone(), tx);
 
         // Jika user reconnect dengan role berbeda, bersihkan set lama dulu
@@ -349,15 +359,18 @@ impl ConnectionManager {
 
         // NX: set only if not exists — cegah ghost overwrite saat race reconnect
         let mut redis = (*self.redis).clone();
-        let _: Result<(), _> = redis
-            .set_options(
+        if let Err(e) = redis
+            .set_options::<_, _, ()>(
                 format!("online:{}", user_id),
                 role,
                 redis::SetOptions::default()
                     .with_expiration(redis::SetExpiry::EX(PRESENCE_TTL_SECS as usize))
                     .conditional_set(redis::ExistenceCheck::NX),
             )
-            .await;
+            .await
+        {
+            tracing::error!(user_id, error = %e, "Failed to set presence in Redis");
+        }
 
         (rx, CancellationToken::new())
     }

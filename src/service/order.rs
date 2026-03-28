@@ -171,24 +171,6 @@ where
         Ok(order)
     }
 
-    // di order.rs
-    pub async fn has_active_order_with(&self, rider_id: &str, driver_id: &str) -> bool {
-        match self
-            .order_repo
-            .find_active_between(rider_id, driver_id)
-            .await
-        {
-            Ok(Some(order)) => {
-                // Hanya boleh chat saat order sudah ada driver (bukan searching/cancelled)
-                matches!(
-                    order.status.as_str(),
-                    "driver_accepted" | "driver_arrived" | "on_trip"
-                )
-            }
-            _ => false,
-        }
-    }
-
     /// Dipanggil saat user disconnect — cancel order yang masih aktif
     /// Return Ok(Some(order_id)) jika ada yang di-cancel, Ok(None) jika tidak ada
     pub async fn cancel_active_order_on_disconnect(&self, user_id: &str) -> Result<Option<String>> {
@@ -509,7 +491,9 @@ where
         }
 
         // Setelah DB berhasil, baru set Redis
-        self.location.set_driver_order(driver_id, order_id).await?;
+        self.location
+            .set_driver_order(driver_id, order_id, &order.service_type)
+            .await?;
 
         let driver_info = self.build_driver_info(driver_id).await;
 

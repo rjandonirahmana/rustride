@@ -1,10 +1,21 @@
-// ===== LOCATION SERVICE - FINAL PRODUCTION =====
+// ===== LOCATION SERVICE - PRODUCTION v2.1 =====
 //
 // Key design:
-//   geo:{service_type}              → Redis GEO sorted set, semua driver
+//   geo:{service_type}              → Redis GEO sorted set, semua driver (cleanup & stats)
+//   geo:{service_type}:ready        → Redis GEO sorted set, hanya driver available
 //   {driver_id}:loc                 → SETEX 30s, proto bytes (source of truth online)
 //   {driver_id}:order               → SETEX 4h, order_id jika driver busy
 //   {driver_id}:svc                 → SETEX 30s, service_type aktif
+//
+// Invariant geo:ready:
+//   Driver masuk :ready  → heartbeat, HANYA jika tidak sedang busy (cek order)
+//   Driver keluar :ready → set_driver_order (ZREM atomic dengan SET order)
+//   Driver re-masuk :ready → heartbeat berikutnya setelah order clear
+//
+// Race condition heartbeat vs order:
+//   Diselesaikan dengan cek EXISTS {driver}:order di heartbeat.
+//   Mahal? Ya, tapi hanya 1 GET per heartbeat per driver — jauh lebih murah
+//   dari double dispatch. Trade-off yang benar untuk ride-hailing.
 //
 // Cluster-safe: semua key per-driver pakai hashtag {driver_id} agar
 // multi-key ops berada di slot yang sama.
@@ -24,10 +35,16 @@ const META_TTL_SECS: u64 = 30;
 const ORDER_TTL_SECS: u64 = 3600 * 4;
 
 const SEARCH_RADIUS_KM: f64 = 5.0;
-const SEARCH_RADIUS_EXPAND_KM: f64 = 10.0; // fallback jika hasil < MIN_DRIVERS
-const MIN_DRIVERS: usize = 3; // threshold sebelum expand radius
+const SEARCH_RADIUS_EXPAND_KM: f64 = 10.0;
+const MIN_DRIVERS: usize = 3;
 const MAX_DRIVERS: usize = 10;
-const CANDIDATE_FETCH: usize = MAX_DRIVERS * 3; // lebih banyak karena akan difilter
+
+// +5 buffer untuk absorb driver offline/leak yang lolos GEOSEARCH :ready.
+// Tidak lagi *3 karena :ready sudah pre-filter busy drivers.
+const CANDIDATE_FETCH: usize = MAX_DRIVERS + 5;
+
+// Safety net EXISTS check hanya untuk N kandidat teratas.
+const EXISTS_SAFETY_CHECK_N: usize = 3;
 
 // ── LocationService ───────────────────────────────────────────────────────────
 
@@ -41,15 +58,18 @@ impl LocationService {
         Self { redis }
     }
 
-    // ── Key Helpers (Cluster-safe dengan hashtag {driver_id}) ─────────────────
+    // ── Key Helpers ───────────────────────────────────────────────────────────
 
-    /// "geo:motor", "geo:mobil" — global per service type
     #[inline]
     fn geo_key(service_type: &str) -> String {
         format!("{}{}", GEO_PREFIX, service_type)
     }
 
-    /// "{driver_id}:loc" — hashtag agar semua key driver satu slot di cluster
+    #[inline]
+    fn geo_ready_key(service_type: &str) -> String {
+        format!("{}{}:ready", GEO_PREFIX, service_type)
+    }
+
     #[inline]
     fn loc_key(driver_id: &str) -> String {
         format!("{{{}}}:loc", driver_id)
@@ -60,7 +80,6 @@ impl LocationService {
         format!("{{{}}}:order", driver_id)
     }
 
-    /// Simpan service_type aktif driver untuk deteksi pergantian tipe
     #[inline]
     fn svc_key(driver_id: &str) -> String {
         format!("{{{}}}:svc", driver_id)
@@ -90,11 +109,24 @@ impl LocationService {
 
     // ── Update Location ───────────────────────────────────────────────────────
 
-    /// Atomic pipeline:
-    ///   1. Cek service_type lama → jika beda, ZREM dari geo key lama
-    ///   2. GEOADD ke geo key baru
-    ///   3. SETEX loc (metadata + TTL heartbeat)
-    ///   4. SETEX svc (service_type aktif)
+    /// Atomic pipeline dengan order-aware :ready insertion.
+    ///
+    /// Flow:
+    ///   1. Cek service_type lama → jika beda, ZREM dari kedua geo key lama
+    ///   2. Cek EXISTS {driver}:order → jika busy, skip GEOADD :ready
+    ///   3. GEOADD ke geo global (selalu)
+    ///   4. GEOADD ke geo:ready (hanya jika tidak busy)
+    ///   5. SETEX loc + SETEX svc
+    ///
+    /// Kenapa GET order di heartbeat?
+    ///
+    /// Alternatif: `{driver}:was_ready` flag menambah key baru dengan
+    /// lifetime yang perlu di-manage tersendiri (cleanup, TTL, dll).
+    /// Satu GET per heartbeat lebih predictable dan tidak ada state ekstra.
+    ///
+    /// Cost: 1 GET + 1 pipeline per heartbeat (~5 detik per driver).
+    /// Untuk 10.000 driver aktif: 2.000 GET/detik — acceptable untuk
+    /// mencegah double dispatch yang cost-nya jauh lebih tinggi.
     pub async fn update_driver_location(
         &self,
         driver_id: &str,
@@ -110,10 +142,27 @@ impl LocationService {
         let mut redis = self.redis.clone();
         let svc_key = Self::svc_key(driver_id);
         let loc_key = Self::loc_key(driver_id);
+        let order_key = Self::order_key(driver_id);
         let new_geo_key = Self::geo_key(service_type);
+        let new_ready_key = Self::geo_ready_key(service_type);
 
-        // Cek apakah driver ganti service_type
-        let old_svc: Option<String> = redis.get(&svc_key).await.unwrap_or(None);
+        // Dua GET sekaligus: svc lama + order status
+        // Ini satu-satunya roundtrip sebelum pipeline utama
+        let (old_svc, has_order): (Option<String>, bool) = {
+            let mut pipe = redis::pipe();
+            pipe.get(&svc_key).exists(&order_key);
+            let (svc, ord): (Option<String>, i64) =
+                pipe.query_async(&mut redis).await.unwrap_or_else(|e| {
+                    tracing::error!(
+                        driver = driver_id,
+                        error = ?e,
+                        "redis failed fetching svc/order state, assuming not busy"
+                    );
+                    (None, 0)
+                });
+            (svc, ord == 1)
+        };
+
         let switched = old_svc
             .as_deref()
             .map(|s| s != service_type)
@@ -131,19 +180,24 @@ impl LocationService {
         let mut pipe = redis::pipe();
         pipe.atomic();
 
-        // Jika ganti service_type, hapus dari geo key lama
         if switched {
-            let old_geo_key = Self::geo_key(old_svc.as_deref().unwrap());
-            pipe.cmd("ZREM").arg(&old_geo_key).arg(driver_id);
+            let old_svc_str = old_svc.as_deref().unwrap();
+            pipe.cmd("ZREM")
+                .arg(Self::geo_key(old_svc_str))
+                .arg(driver_id)
+                .cmd("ZREM")
+                .arg(Self::geo_ready_key(old_svc_str))
+                .arg(driver_id);
 
             tracing::debug!(
                 driver = driver_id,
-                from = old_svc.as_deref().unwrap_or("?"),
+                from = old_svc_str,
                 to = service_type,
                 "driver switched service type"
             );
         }
 
+        // Selalu update geo global dan metadata
         pipe.cmd("GEOADD")
             .arg(&new_geo_key)
             .arg(lng)
@@ -158,9 +212,23 @@ impl LocationService {
             .arg(META_TTL_SECS)
             .arg(service_type);
 
-        let _: () = pipe
-            .query_async(&mut redis)
+        // :ready hanya jika tidak sedang busy
+        if !has_order {
+            pipe.cmd("GEOADD")
+                .arg(&new_ready_key)
+                .arg(lng)
+                .arg(lat)
+                .arg(driver_id);
+        } else {
+            tracing::debug!(
+                driver = driver_id,
+                "heartbeat skipped :ready insertion — driver has active order"
+            );
+        }
+
+        pipe.query_async(&mut redis)
             .await
+            .map(|_: ()| ())
             .context("Failed to update driver location")?;
 
         Ok(())
@@ -171,10 +239,13 @@ impl LocationService {
     pub async fn remove_driver(&self, driver_id: &str, service_type: &str) -> Result<()> {
         Self::validate_driver_id(driver_id)?;
 
-        let _: () = redis::pipe()
+        redis::pipe()
             .atomic()
             .cmd("ZREM")
             .arg(Self::geo_key(service_type))
+            .arg(driver_id)
+            .cmd("ZREM")
+            .arg(Self::geo_ready_key(service_type))
             .arg(driver_id)
             .cmd("DEL")
             .arg(Self::loc_key(driver_id))
@@ -182,18 +253,17 @@ impl LocationService {
             .arg(Self::svc_key(driver_id))
             .query_async(&mut self.redis.clone())
             .await
-            .context("Failed to remove driver")?;
-
-        Ok(())
+            .map(|_: ()| ())
+            .context("Failed to remove driver")
     }
 
     // ── Find Nearby Drivers ───────────────────────────────────────────────────
 
     /// Alur:
-    ///   1. GEOSEARCH 1x, ASC, limit CANDIDATE_FETCH
-    ///   2. Jika hasil < MIN_DRIVERS, expand ke SEARCH_RADIUS_EXPAND_KM
-    ///   3. MGET batch semua driver:loc → dapat data + filter offline sekaligus
-    ///   4. EXISTS batch semua driver:order → filter busy
+    ///   1. GEOSEARCH di :ready (sudah exclude busy + offline sebagian besar)
+    ///   2. Expand jika hasil < MIN_DRIVERS
+    ///   3. MGET batch loc → filter driver offline (TTL expired)
+    ///   4. EXISTS safety check untuk top-N → filter race condition leak
     ///   5. Collect MAX_DRIVERS pertama
     pub async fn find_nearby_drivers(
         &self,
@@ -205,15 +275,13 @@ impl LocationService {
 
         let mut redis = self.redis.clone();
 
-        // 1. Try normal radius
         let mut candidates = self
-            .geosearch_candidates(lat, lng, service_type, SEARCH_RADIUS_KM)
+            .geosearch_ready(lat, lng, service_type, SEARCH_RADIUS_KM)
             .await?;
 
-        // 2. Expand jika kurang
         if candidates.len() < MIN_DRIVERS {
             candidates = self
-                .geosearch_candidates(lat, lng, service_type, SEARCH_RADIUS_EXPAND_KM)
+                .geosearch_ready(lat, lng, service_type, SEARCH_RADIUS_EXPAND_KM)
                 .await?;
         }
 
@@ -221,39 +289,69 @@ impl LocationService {
             return Ok(vec![]);
         }
 
-        // 3. Batch MGET loc (cek online)
+        // MGET loc — filter offline. is_some() tanpa decode cukup untuk cek keberadaan.
         let loc_keys: Vec<String> = candidates.iter().map(|(id, _)| Self::loc_key(id)).collect();
 
         let loc_data: Vec<Option<Vec<u8>>> = redis::cmd("MGET")
             .arg(&loc_keys)
             .query_async(&mut redis)
             .await
-            .unwrap_or_else(|_| vec![None; candidates.len()]);
+            .unwrap_or_else(|e| {
+                tracing::error!(error = ?e, "redis MGET loc failed in find_nearby_drivers");
+                vec![None; candidates.len()]
+            });
 
-        // 4. Pipeline EXISTS order (cek busy)
+        // Filter: hanya driver yang loc key-nya masih hidup
+        let online_candidates: Vec<(&str, f64)> = candidates
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (id, dist_m))| {
+                if loc_data.get(i).and_then(|v| v.as_ref()).is_some() {
+                    Some((id.as_str(), *dist_m))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if online_candidates.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // EXISTS safety check — hanya top-N
+        let safety_n = EXISTS_SAFETY_CHECK_N.min(online_candidates.len());
+        let top_n = &online_candidates[..safety_n];
+
         let mut pipe = redis::pipe();
-        for (id, _) in &candidates {
+        for &(id, _) in top_n {
             pipe.cmd("EXISTS").arg(Self::order_key(id));
         }
 
-        let order_exists: Vec<i64> = pipe
-            .query_async(&mut redis)
-            .await
-            .unwrap_or_else(|_| vec![0; candidates.len()]);
+        let order_exists: Vec<i64> = pipe.query_async(&mut redis).await.unwrap_or_else(|e| {
+            tracing::error!(error = ?e, "redis EXISTS order failed in safety check");
+            vec![0; safety_n]
+        });
 
-        // 5. Filter + limit
+        let busy_ids: std::collections::HashSet<&str> = top_n
+            .iter()
+            .zip(order_exists.iter())
+            .filter(|(_, &exists)| exists == 1)
+            .map(|(&(id, _), _)| id)
+            .collect();
+
+        if !busy_ids.is_empty() {
+            tracing::warn!(
+                count = busy_ids.len(),
+                "safety check caught leak: driver in :ready with active order"
+            );
+        }
+
         let mut result = Vec::with_capacity(MAX_DRIVERS);
-
-        for i in 0..candidates.len() {
-            let (ref driver_id, dist_m) = candidates[i];
-
-            let is_online = loc_data.get(i).and_then(|v| v.as_ref()).is_some();
-            let has_order = order_exists.get(i).copied().unwrap_or(0) == 1;
-
-            if is_online && !has_order {
-                result.push((driver_id.clone(), dist_m));
+        for &(driver_id, dist_m) in &online_candidates {
+            if busy_ids.contains(driver_id) {
+                continue;
             }
-
+            result.push((driver_id.to_string(), dist_m));
             if result.len() >= MAX_DRIVERS {
                 break;
             }
@@ -262,15 +360,14 @@ impl LocationService {
         Ok(result)
     }
 
-    /// GEOSEARCH helper — reusable untuk radius normal dan expand
-    async fn geosearch_candidates(
+    async fn geosearch_ready(
         &self,
         lat: f64,
         lng: f64,
         service_type: &str,
         radius_km: f64,
     ) -> Result<Vec<(String, f64)>> {
-        let geo_key = Self::geo_key(service_type);
+        let geo_key = Self::geo_ready_key(service_type);
 
         let raw: Vec<Vec<String>> = redis::cmd("GEOSEARCH")
             .arg(&geo_key)
@@ -286,7 +383,10 @@ impl LocationService {
             .arg("WITHDIST")
             .query_async(&mut self.redis.clone())
             .await
-            .unwrap_or_default();
+            .unwrap_or_else(|e| {
+                tracing::error!(error = ?e, service_type, radius_km, "GEOSEARCH failed");
+                vec![]
+            });
 
         Ok(raw
             .into_iter()
@@ -298,50 +398,6 @@ impl LocationService {
                 Some((item[0].clone(), dist_m))
             })
             .collect())
-    }
-
-    /// Filter kandidat: skip offline (loc expired) atau busy (has order)
-    ///
-    /// Menggunakan MGET untuk loc keys → dapat proto bytes sekaligus,
-    /// lebih efisien dari EXISTS karena data sudah ada di response.
-    async fn filter_available(&self, candidates: Vec<(String, f64)>) -> Result<Vec<(String, f64)>> {
-        let mut redis = self.redis.clone();
-
-        // MGET semua loc keys dalam satu roundtrip
-        let loc_keys: Vec<String> = candidates.iter().map(|(id, _)| Self::loc_key(id)).collect();
-
-        let loc_data: Vec<Option<Vec<u8>>> = redis::cmd("MGET")
-            .arg(&loc_keys)
-            .query_async(&mut redis)
-            .await
-            .unwrap_or_else(|_| vec![None; candidates.len()]);
-
-        // EXISTS batch untuk order keys
-        let mut pipe = redis::pipe();
-        for (id, _) in &candidates {
-            pipe.cmd("EXISTS").arg(Self::order_key(id));
-        }
-        let order_exists: Vec<i64> = pipe
-            .query_async(&mut redis)
-            .await
-            .unwrap_or_else(|_| vec![0; candidates.len()]);
-
-        let mut result = Vec::with_capacity(MAX_DRIVERS);
-
-        for (i, (driver_id, dist_m)) in candidates.into_iter().enumerate() {
-            let is_online = loc_data.get(i).and_then(|v| v.as_ref()).is_some();
-            let has_order = order_exists.get(i).copied().unwrap_or(0) == 1;
-
-            if is_online && !has_order {
-                result.push((driver_id, dist_m));
-            }
-
-            if result.len() >= MAX_DRIVERS {
-                break;
-            }
-        }
-
-        Ok(result)
     }
 
     // ── Get Driver Location ───────────────────────────────────────────────────
@@ -410,23 +466,46 @@ impl LocationService {
         };
 
         let fare = base + (distance_m / 1000.0) * per_km + (duration_sec as f64 / 60.0) * per_min;
-
         (fare * surge).max(8000.0)
     }
 
     // ── Order Tracking ────────────────────────────────────────────────────────
 
-    pub async fn set_driver_order(&self, driver_id: &str, order_id: &str) -> Result<()> {
+    /// Atomic: SET order + ZREM dari :ready.
+    ///
+    /// Ini satu-satunya tempat driver keluar dari :ready secara eksplisit.
+    /// Heartbeat akan skip re-insert selama order key masih hidup.
+    pub async fn set_driver_order(
+        &self,
+        driver_id: &str,
+        order_id: &str,
+        service_type: &str,
+    ) -> Result<()> {
         Self::validate_driver_id(driver_id)?;
         if order_id.is_empty() {
             anyhow::bail!("order_id cannot be empty");
         }
-        let _: () = self
-            .redis
-            .clone()
-            .set_ex(Self::order_key(driver_id), order_id, ORDER_TTL_SECS)
+
+        redis::pipe()
+            .atomic()
+            .cmd("SET")
+            .arg(Self::order_key(driver_id))
+            .arg(order_id)
+            .arg("EX")
+            .arg(ORDER_TTL_SECS)
+            .cmd("ZREM")
+            .arg(Self::geo_ready_key(service_type))
+            .arg(driver_id)
+            .query_async(&mut self.redis.clone())
             .await
+            .map(|_: ()| ())
             .context("Failed to set driver order")?;
+
+        tracing::debug!(
+            driver = driver_id,
+            order = order_id,
+            "driver assigned, removed from :ready"
+        );
         Ok(())
     }
 
@@ -439,84 +518,176 @@ impl LocationService {
             .context("Failed to get driver order")
     }
 
+    /// Hanya DEL order key.
+    ///
+    /// Driver re-enter :ready via heartbeat berikutnya (~5 detik).
+    /// Tidak perlu GEOADD di sini karena: (1) koordinat yang tersimpan
+    /// mungkin sudah stale, (2) heartbeat selalu bawa koordinat terbaru.
     pub async fn clear_driver_order(&self, driver_id: &str) -> Result<()> {
         Self::validate_driver_id(driver_id)?;
-        let _: () = self
-            .redis
+        self.redis
             .clone()
             .del(Self::order_key(driver_id))
             .await
+            .map(|_: ()| ())
             .context("Failed to clear driver order")?;
+
+        tracing::debug!(
+            driver = driver_id,
+            "order cleared, re-enter :ready on next heartbeat"
+        );
         Ok(())
     }
 
     // ── Stale GEO Cleanup ─────────────────────────────────────────────────────
 
-    /// Hapus driver dari geo index yang loc key-nya sudah expire.
-    /// Race condition acceptable: driver kirim heartbeat <30s → re-insert otomatis.
-    pub async fn cleanup_stale_drivers(&self, service_type: &str) -> Result<usize> {
+    /// Cleanup dengan batching untuk menghindari O(N) spike di Redis.
+    ///
+    /// ZRANGE 0 -1 dengan 100k driver adalah satu response ~4MB.
+    /// Batch per CLEANUP_BATCH_SIZE menghindari memory spike dan
+    /// memberi Redis napas antara batch.
+    pub async fn cleanup_stale_drivers(&self, service_type: &str) -> Result<CleanupReport> {
+        const CLEANUP_BATCH_SIZE: isize = 500;
+
         let mut redis = self.redis.clone();
         let geo_key = Self::geo_key(service_type);
+        let ready_key = Self::geo_ready_key(service_type);
 
-        let all_drivers: Vec<String> = redis::cmd("ZRANGE")
-            .arg(&geo_key)
+        let mut report = CleanupReport::default();
+        let mut cursor: isize = 0;
+
+        loop {
+            let batch: Vec<String> = redis::cmd("ZRANGE")
+                .arg(&geo_key)
+                .arg(cursor)
+                .arg(cursor + CLEANUP_BATCH_SIZE - 1)
+                .query_async(&mut redis)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::error!(
+                        error = ?e,
+                        service_type,
+                        cursor,
+                        "ZRANGE failed in cleanup batch"
+                    );
+                    vec![]
+                });
+
+            if batch.is_empty() {
+                break;
+            }
+
+            let is_last_batch = batch.len() < CLEANUP_BATCH_SIZE as usize;
+
+            // Cek mana yang offline
+            let loc_keys: Vec<String> = batch.iter().map(|id| Self::loc_key(id)).collect();
+            let loc_data: Vec<Option<Vec<u8>>> = redis::cmd("MGET")
+                .arg(&loc_keys)
+                .query_async(&mut redis)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::error!(error = ?e, "MGET loc failed in cleanup batch");
+                    vec![None; batch.len()]
+                });
+
+            let stale: Vec<&str> = batch
+                .iter()
+                .zip(loc_data.iter())
+                .filter(|(_, data)| data.is_none())
+                .map(|(id, _)| id.as_str())
+                .collect();
+
+            if !stale.is_empty() {
+                let mut pipe = redis::pipe();
+                pipe.atomic();
+                for id in &stale {
+                    pipe.cmd("ZREM").arg(&geo_key).arg(*id);
+                    pipe.cmd("ZREM").arg(&ready_key).arg(*id);
+                }
+                pipe.query_async(&mut redis)
+                    .await
+                    .map(|_: ()| ())
+                    .unwrap_or_else(|e| {
+                        tracing::error!(error = ?e, "ZREM stale failed");
+                    });
+
+                report.stale_removed += stale.len();
+            }
+
+            if is_last_batch {
+                break;
+            }
+            cursor += CLEANUP_BATCH_SIZE;
+        }
+
+        if report.stale_removed > 0 {
+            tracing::info!(
+                count = report.stale_removed,
+                service_type,
+                "removed stale drivers from geo indexes"
+            );
+        }
+
+        // Leak detection: driver di :ready yang punya order aktif
+        // Dengan fix heartbeat, ini seharusnya mendekati nol.
+        // Jika konsisten tinggi → sinyal bug di set_driver_order caller.
+        let ready_drivers: Vec<String> = redis::cmd("ZRANGE")
+            .arg(&ready_key)
             .arg(0)
             .arg(-1)
             .query_async(&mut redis)
             .await
-            .unwrap_or_default();
+            .unwrap_or_else(|e| {
+                tracing::error!(error = ?e, "ZRANGE :ready failed in leak detection");
+                vec![]
+            });
 
-        if all_drivers.is_empty() {
-            return Ok(0);
+        if !ready_drivers.is_empty() {
+            let mut pipe = redis::pipe();
+            for id in &ready_drivers {
+                pipe.cmd("EXISTS").arg(Self::order_key(id));
+            }
+            let order_exists: Vec<i64> = pipe.query_async(&mut redis).await.unwrap_or_else(|e| {
+                tracing::error!(error = ?e, "EXISTS check failed in leak detection");
+                vec![0; ready_drivers.len()]
+            });
+
+            let leaked: Vec<&str> = ready_drivers
+                .iter()
+                .zip(order_exists.iter())
+                .filter(|(_, &exists)| exists == 1)
+                .map(|(id, _)| id.as_str())
+                .collect();
+
+            report.leak_detected = leaked.len();
+
+            if !leaked.is_empty() {
+                tracing::warn!(
+                    count = report.leak_detected,
+                    service_type,
+                    drivers = ?leaked,
+                    "LEAK: drivers in :ready with active order — check set_driver_order callers"
+                );
+            }
         }
 
-        let loc_keys: Vec<String> = all_drivers.iter().map(|id| Self::loc_key(id)).collect();
-        let exists: Vec<Option<Vec<u8>>> = redis::cmd("MGET")
-            .arg(&loc_keys)
-            .query_async(&mut redis)
-            .await
-            .unwrap_or_else(|_| vec![None; all_drivers.len()]);
-
-        let stale: Vec<&str> = all_drivers
-            .iter()
-            .zip(exists.iter())
-            .filter(|(_, data)| data.is_none())
-            .map(|(id, _)| id.as_str())
-            .collect();
-
-        if stale.is_empty() {
-            return Ok(0);
-        }
-
-        let mut pipe = redis::pipe();
-        pipe.atomic();
-        for id in &stale {
-            pipe.cmd("ZREM").arg(&geo_key).arg(*id);
-        }
-        let _: () = pipe.query_async(&mut redis).await?;
-
-        tracing::info!(
-            count = stale.len(),
-            service_type,
-            "cleaned stale drivers from geo index"
-        );
-
-        Ok(stale.len())
+        Ok(report)
     }
 
     // ── Stats ─────────────────────────────────────────────────────────────────
 
     pub async fn count_active_drivers(&self, service_type: &str) -> Result<usize> {
         let mut redis = self.redis.clone();
-        let geo_key = Self::geo_key(service_type);
-
         let all: Vec<String> = redis::cmd("ZRANGE")
-            .arg(&geo_key)
+            .arg(Self::geo_key(service_type))
             .arg(0)
             .arg(-1)
             .query_async(&mut redis)
             .await
-            .unwrap_or_default();
+            .unwrap_or_else(|e| {
+                tracing::error!(error = ?e, "ZRANGE failed in count_active_drivers");
+                vec![]
+            });
 
         if all.is_empty() {
             return Ok(0);
@@ -527,26 +698,39 @@ impl LocationService {
             .arg(&loc_keys)
             .query_async(&mut redis)
             .await
-            .unwrap_or_default();
+            .unwrap_or_else(|e| {
+                tracing::error!(error = ?e, "MGET failed in count_active_drivers");
+                vec![]
+            });
 
         Ok(data.iter().filter(|v| v.is_some()).count())
     }
+
+    /// Hitung driver yang benar-benar ready untuk dispatch (O(1)).
+    pub async fn count_ready_drivers(&self, service_type: &str) -> Result<usize> {
+        redis::cmd("ZCARD")
+            .arg(Self::geo_ready_key(service_type))
+            .query_async(&mut self.redis.clone())
+            .await
+            .map_err(|e| {
+                tracing::error!(error = ?e, "ZCARD failed in count_ready_drivers");
+                anyhow::anyhow!("Failed to count ready drivers: {e}")
+            })
+    }
+}
+
+// ── Cleanup Report ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Default)]
+pub struct CleanupReport {
+    pub stale_removed: usize,
+    pub leak_detected: usize,
 }
 
 // ── Background Cleanup Task ───────────────────────────────────────────────────
 
 const SERVICE_TYPES: &[&str] = &["motor", "mobil", "food", "send", "nebeng"];
 
-/// Spawn cleanup task dengan graceful shutdown via CancellationToken.
-///
-/// ```rust
-/// let token = CancellationToken::new();
-/// let handle = spawn_cleanup_task(svc.clone(), 60, token.clone());
-///
-/// // Saat shutdown:
-/// token.cancel();
-/// handle.await.ok();
-/// ```
 pub fn spawn_cleanup_task(
     svc: std::sync::Arc<LocationService>,
     interval_secs: u64,
@@ -554,8 +738,6 @@ pub fn spawn_cleanup_task(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
-
-        // Skip missed ticks — jika cleanup lambat, tidak burst catch-up
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
@@ -573,17 +755,27 @@ pub fn spawn_cleanup_task(
 }
 
 async fn run_cleanup(svc: &LocationService) {
-    let mut total = 0usize;
+    let mut total_stale = 0usize;
+    let mut total_leak = 0usize;
 
     for &st in SERVICE_TYPES {
         match svc.cleanup_stale_drivers(st).await {
-            Ok(n) => total += n,
+            Ok(report) => {
+                total_stale += report.stale_removed;
+                total_leak += report.leak_detected;
+            }
             Err(e) => tracing::error!(service_type = st, error = ?e, "cleanup failed"),
         }
     }
 
-    if total > 0 {
-        tracing::info!(total, "stale driver entries removed");
+    if total_stale > 0 {
+        tracing::info!(total_stale, "stale driver entries removed");
+    }
+
+    if total_leak > 0 {
+        // Leak metric — push ke Prometheus/Datadog via counter jika tersedia:
+        // metrics::gauge!("location.geo_ready_leak", total_leak as f64);
+        tracing::warn!(total_leak, "geo:ready leak detected this cycle");
     }
 }
 
@@ -606,23 +798,16 @@ mod tests {
 
     #[test]
     fn test_key_format_cluster_safe() {
-        let loc = LocationService::loc_key("driver123");
-        let order = LocationService::order_key("driver123");
-        let svc = LocationService::svc_key("driver123");
-
-        assert!(loc.contains("{driver123}"), "loc key missing hashtag");
-        assert!(order.contains("{driver123}"), "order key missing hashtag");
-        assert!(svc.contains("{driver123}"), "svc key missing hashtag");
-
-        assert_eq!(loc, "{driver123}:loc");
-        assert_eq!(order, "{driver123}:order");
-        assert_eq!(svc, "{driver123}:svc");
+        assert_eq!(LocationService::loc_key("driver123"), "{driver123}:loc");
+        assert_eq!(LocationService::order_key("driver123"), "{driver123}:order");
+        assert_eq!(LocationService::svc_key("driver123"), "{driver123}:svc");
     }
 
     #[test]
-    fn test_geo_key() {
+    fn test_geo_keys() {
         assert_eq!(LocationService::geo_key("motor"), "geo:motor");
-        assert_eq!(LocationService::geo_key("mobil"), "geo:mobil");
+        assert_eq!(LocationService::geo_ready_key("motor"), "geo:motor:ready");
+        assert_eq!(LocationService::geo_ready_key("food"), "geo:food:ready");
     }
 
     #[test]
@@ -637,8 +822,18 @@ mod tests {
     fn test_validate_coords_err() {
         assert!(LocationService::validate_coords(91.0, 0.0).is_err());
         assert!(LocationService::validate_coords(0.0, 181.0).is_err());
+        assert!(LocationService::validate_coords(-90.1, 0.0).is_err());
+        assert!(LocationService::validate_coords(0.0, -180.1).is_err());
         assert!(LocationService::validate_coords(f64::NAN, 0.0).is_err());
         assert!(LocationService::validate_coords(0.0, f64::INFINITY).is_err());
+    }
+
+    #[test]
+    fn test_validate_driver_id() {
+        assert!(LocationService::validate_driver_id("").is_err());
+        assert!(LocationService::validate_driver_id(&"a".repeat(129)).is_err());
+        assert!(LocationService::validate_driver_id(&"a".repeat(128)).is_ok());
+        assert!(LocationService::validate_driver_id("driver-abc-123").is_ok());
     }
 
     #[test]
@@ -648,7 +843,13 @@ mod tests {
     }
 
     #[test]
-    fn test_calculate_fare_minimum() {
+    fn test_haversine_same_point() {
+        let d = haversine_m(-6.2088, 106.8456, -6.2088, 106.8456);
+        assert!(d < 0.001, "same point should be ~0m, got {d}");
+    }
+
+    #[test]
+    fn test_calculate_fare_minimum_enforced() {
         let fare = LocationService::calculate_fare(100.0, 60, "motor", 1.0);
         assert_eq!(fare, 8000.0);
     }
@@ -661,9 +862,42 @@ mod tests {
     }
 
     #[test]
+    fn test_calculate_fare_motor() {
+        // base=3000, 5km*1500=7500, 10min*300=3000 → 13500
+        let fare = LocationService::calculate_fare(5_000.0, 600, "motor", 1.0);
+        assert!((fare - 13_500.0).abs() < 1.0, "got {fare}");
+    }
+
+    #[test]
     fn test_calculate_fare_surge() {
         let normal = LocationService::calculate_fare(10_000.0, 1200, "motor", 1.0);
         let surge = LocationService::calculate_fare(10_000.0, 1200, "motor", 1.5);
         assert!((surge - normal * 1.5).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_calculate_fare_unknown_service() {
+        let fare = LocationService::calculate_fare(10_000.0, 1200, "unknown", 1.0);
+        assert_eq!(fare, 8000.0);
+    }
+
+    #[test]
+    fn test_constants_sanity() {
+        assert!(EXISTS_SAFETY_CHECK_N <= MAX_DRIVERS);
+        assert!(CANDIDATE_FETCH >= MAX_DRIVERS);
+        assert!(MIN_DRIVERS < MAX_DRIVERS);
+        assert!(SEARCH_RADIUS_KM < SEARCH_RADIUS_EXPAND_KM);
+        // Buffer harus ada
+        assert!(
+            CANDIDATE_FETCH > MAX_DRIVERS,
+            "no buffer for offline/leak filtering"
+        );
+    }
+
+    #[test]
+    fn test_cleanup_report_default() {
+        let r = CleanupReport::default();
+        assert_eq!(r.stale_removed, 0);
+        assert_eq!(r.leak_detected, 0);
     }
 }

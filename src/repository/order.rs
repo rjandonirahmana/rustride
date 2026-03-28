@@ -1,7 +1,6 @@
 use anyhow::{Ok, Result};
 use async_trait::async_trait;
 use mysql_async::{from_value, params, prelude::Queryable, Pool, Row};
-use ulid::Ulid;
 
 use super::db::{col, col_opt_f32, col_opt_i32, exec_drop, exec_rows};
 use crate::models::order::Order;

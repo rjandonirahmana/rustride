@@ -5,6 +5,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 mod auth;
 mod config;
 mod connections;
+mod context;
 mod grpc;
 mod location;
 mod models;
@@ -12,8 +13,8 @@ mod proto;
 mod repository;
 mod service;
 mod state;
+mod throttle;
 mod utils;
-
 use auth::JwtService;
 use grpc::{auth::AuthServiceImpl, trip::TripServiceImpl};
 use proto::auth::auth_service_server::AuthServiceServer;
@@ -34,6 +35,7 @@ use crate::{
     repository::{driver, message::MessageRepository, notification, rideshare},
     service::driver::DriverService,
     state::AppState,
+    throttle::ThrottleMap,
 };
 
 #[tokio::main]
@@ -187,6 +189,7 @@ async fn main() -> anyhow::Result<()> {
                 user_repo: user_repo,
                 connections: state.connections.clone(),
             }),
+            throttle: Arc::new(ThrottleMap::new()), // ✅ WAJIB
         }))
         .serve(addr)
         .await?;
