@@ -60,6 +60,8 @@ fn status_event(
     status: &str,
     service_tye: &str,
     fare_estimate: &i32,
+    rider_id: &str,
+    rider_name: &str,
 ) -> Arc<ServerEvent> {
     Arc::new(ServerEvent {
         payload: Some(Sp::OrderStatus(OrderStatusEvent {
@@ -68,6 +70,8 @@ fn status_event(
             driver: None,
             service_type: service_tye.to_string(),
             fare_estimate: *fare_estimate,
+            rider_id: rider_id.to_string(),
+            rider_name: rider_name.to_string(),
         })),
     })
 }
@@ -156,6 +160,8 @@ where
                 "searching",
                 &order.service_type,
                 &order.fare_estimate,
+                &order.rider_id,
+                &order.rider_name,
             ),
             Priority::Normal,
         );
@@ -198,6 +204,8 @@ where
                         driver: None,
                         service_type: order.service_type.clone(),
                         fare_estimate: order.fare_estimate,
+                        rider_id: order.rider_id.clone(),
+                        rider_name: order.rider_name,
                     })),
                 }),
                 Priority::Normal,
@@ -215,6 +223,8 @@ where
                             driver: None,
                             service_type: order.service_type.clone(),
                             fare_estimate: order.fare_estimate,
+                            rider_id: order.rider_id,
+                            rider_name: order.rider_name,
                         })),
                     }),
                     Priority::Normal,
@@ -407,6 +417,8 @@ where
                                 driver: None,
                                 service_type: order.service_type.clone(),
                                 fare_estimate: order.fare_estimate,
+                                rider_id: order.rider_id.clone(),
+                                rider_name: order.rider_name.clone(),
                             })),
                         }),
                         Priority::Normal,
@@ -488,6 +500,8 @@ where
                     driver: driver_info.clone(),
                     service_type: order.service_type.clone(),
                     fare_estimate: order.fare_estimate,
+                    rider_id: order.rider_id.clone(),
+                    rider_name: order.rider_name.clone(),
                 })),
             }),
             Priority::Normal,
@@ -503,6 +517,8 @@ where
                     driver: driver_info,
                     service_type: order.service_type,
                     fare_estimate: order.fare_estimate,
+                    rider_id: order.rider_id,
+                    rider_name: order.rider_name,
                 })),
             }),
             Priority::Normal,
@@ -527,6 +543,8 @@ where
                 "driver_arrived",
                 &order.service_type,
                 &order.fare_estimate,
+                &order.rider_id,
+                &order.rider_name,
             ),
             Priority::Normal,
         );
@@ -537,6 +555,8 @@ where
                 "driver_arrived",
                 &order.service_type,
                 &order.fare_estimate,
+                &order.rider_id,
+                &order.rider_name,
             ),
             Priority::Normal,
         );
@@ -556,6 +576,8 @@ where
                 "on_trip",
                 &order.service_type,
                 &order.fare_estimate,
+                &order.rider_id,
+                &order.rider_name,
             ),
             Priority::Normal,
         );
@@ -566,6 +588,8 @@ where
                 "on_trip",
                 &order.service_type,
                 &order.fare_estimate,
+                &order.rider_id,
+                &order.rider_name,
             ),
             Priority::Normal,
         );
@@ -587,6 +611,8 @@ where
                 "completed",
                 &order.service_type,
                 &order.fare_estimate,
+                &order.rider_id,
+                &order.rider_name,
             ),
             Priority::Normal,
         );
@@ -597,6 +623,8 @@ where
                 "completed",
                 &order.service_type,
                 &order.fare_estimate,
+                &order.rider_id,
+                &order.rider_name,
             ),
             Priority::Normal,
         );
@@ -641,6 +669,8 @@ where
                         "cancelled",
                         &order.service_type,
                         &order.fare_estimate,
+                        &order.rider_id,
+                        &order.rider_name,
                     ),
                     Priority::Normal,
                 );
@@ -654,6 +684,8 @@ where
                     "cancelled",
                     &order.service_type,
                     &order.fare_estimate,
+                    &order.rider_id,
+                    &order.rider_name,
                 ),
                 Priority::Normal,
             );
@@ -665,6 +697,8 @@ where
                 "cancelled",
                 &order.service_type,
                 &order.fare_estimate,
+                &order.rider_id,
+                &order.rider_name,
             ),
             Priority::Normal,
         );

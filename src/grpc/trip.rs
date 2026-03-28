@@ -248,6 +248,8 @@ fn spawn_rider_reconnect<OR, UR>(
                             driver: driver_info,
                             fare_estimate: o.fare_estimate,
                             service_type: o.service_type,
+                            rider_id: o.rider_id,
+                            rider_name: o.rider_name,
                         })),
                     }),
                     Priority::Critical,
