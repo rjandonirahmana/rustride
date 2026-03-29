@@ -14,6 +14,7 @@ pub struct Config {
     pub r2_secret_key: String,
     pub r2_bucket_name: String,
     pub r2_public_url: String,
+    pub database_url_poi: String,
 }
 
 #[derive(Clone)]
@@ -47,6 +48,7 @@ impl Config {
 
         let cfg = Config {
             database_url: env::var("DATABASE_URL").unwrap_or_else(|_| "".into()),
+            database_url_poi: env::var("DATABASE_URL_POI").unwrap_or_else(|_| "".into()),
             redis_url: env::var("REDIS_URL").unwrap_or_else(|_| "".into()),
             jwt_secret: env::var("JWT_SECRET").unwrap_or_else(|_| "default_secret".into()),
             grpc_addr: env::var("GRPC_ADDR").unwrap_or_else(|_| "0.0.0.0:50051".into()),

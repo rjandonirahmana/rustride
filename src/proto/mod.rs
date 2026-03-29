@@ -21,3 +21,7 @@ pub mod notification {
 pub mod driver {
     tonic::include_proto!("driver");
 }
+
+pub mod poi {
+    tonic::include_proto!("poi");
+}

@@ -1,0 +1,51 @@
+syntax = "proto3";
+
+package poi;
+
+service PoiService {
+  rpc SearchNearby (NearbyPoiRequest) returns (NearbyPoiResponse);
+  rpc GetPoiDetail (PoiDetailRequest) returns (PoiDetailResponse);
+}
+
+// ── Request ──────────────────────────────────────────────────────────────────
+
+message NearbyPoiRequest {
+  double lat = 1;
+  double lng = 2;
+  float radius_km = 3;
+  string category = 4; // "amenity", "shop", "tourism", dll
+  string subcategory = 5; // "restaurant", "hospital", dll (opsional)
+  int32 limit = 6;
+}
+
+message PoiDetailRequest {
+  string id = 1;
+}
+
+// ── Response ─────────────────────────────────────────────────────────────────
+
+message NearbyPoiResponse {
+  repeated PoiItem pois = 1;
+}
+
+message PoiDetailResponse {
+  PoiItem poi = 1;
+}
+
+// ── Model ────────────────────────────────────────────────────────────────────
+
+message PoiItem {
+  string id = 1;
+  string name = 2;
+  string name_en = 3;
+  double lat = 4;
+  double lng = 5;
+  string category = 6;
+  string subcategory = 7;
+  string address = 8;
+  string city = 9;
+  string phone = 10;
+  string website = 11;
+  string opening_hours = 12;
+  float distance_m = 13;
+}

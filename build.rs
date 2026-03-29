@@ -10,6 +10,7 @@ fn main() {
                 "proto/notification.proto",
                 "proto/auth.proto",
                 "proto/driver.proto",
+                "proto/poi.proto",
             ],
             &["proto"],
         )

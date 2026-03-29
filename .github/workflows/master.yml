@@ -41,6 +41,7 @@ jobs:
               --runtime=youki \
               -p 50051:50051 \
               -e DATABASE_URL="${{ secrets.DATABASE_URL }}" \
+              -e DATABASE_URL_POI="${{ secrets.DATABASE_URL_POI }}" \
               -e REDIS_URL="${{ secrets.REDIS_URL }}" \
               -e JWT_SECRET="${{ secrets.JWT_SECRET }}" \
               -e R2_ACCOUNT_ID="${{ secrets.R2_ACCOUNT_ID }}" \

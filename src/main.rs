@@ -30,9 +30,11 @@ use crate::{
     proto::{
         driver::driver_service_server, message::message_service_server::MessageServiceServer,
         notification::notification_service_server::NotificationServiceServer,
-        order::order_service_server::OrderServiceServer,
+        order::order_service_server::OrderServiceServer, poi::poi_service_server::PoiServiceServer,
     },
-    repository::{driver, message::MessageRepository, notification, rideshare},
+    repository::{
+        driver, message::MessageRepository, notification, poi::PoiServiceImpl, rideshare,
+    },
     service::driver::DriverService,
     state::AppState,
     throttle::ThrottleMap,
@@ -60,6 +62,11 @@ async fn main() -> anyhow::Result<()> {
 
     let _conn = pool.get_conn().await?;
     tracing::info!("MySQL connected");
+
+    let poi_pool = mysql_async::Pool::new(cfg.database_url_poi.as_str());
+
+    let _conn_poi = poi_pool.get_conn().await?;
+    tracing::info!("MySQL poi connected");
 
     // ── Redis ─────────────────────────────────────────────────────────────────
     let redis_client = redis::Client::open(cfg.redis_url.as_str())?;
@@ -166,6 +173,9 @@ async fn main() -> anyhow::Result<()> {
                 connections: state.connections.clone(),
             }),
             jwt: jwt.clone(),
+        }))
+        .add_service(PoiServiceServer::new(PoiServiceImpl {
+            pool: Arc::new(poi_pool.clone()),
         }))
         .add_service(OrderServiceServer::new(OrderServiceImpl {
             order_svc: state.order_svc.clone(),
