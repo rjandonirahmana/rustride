@@ -133,7 +133,7 @@ pub async fn handle_watch_drivers<OR, UR, RR, NR>(
             }
             ctx.send(
                 Sp::NearbyDrivers(NearbyDriversEvent { drivers: items }),
-                Priority::Normal,
+                Priority::Critical,
             );
         }
         Err(e) => ctx.send_err("FIND_FAILED", &e.to_string()),

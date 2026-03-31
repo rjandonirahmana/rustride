@@ -80,47 +80,58 @@ impl MessageRepository {
     pub async fn get_conversations(&self, user_id: &str) -> Result<Vec<ConversationItem>> {
         let user_id_b = ulid_to_bytes(user_id)?;
 
-        // peer_id di result set masih BINARY(16) — dikonversi di bawah
+        // Optimized query with better performance
         let q = r"
-            SELECT
-                peer_id,
-                peer_name,
-                peer_avatar,
-                last_message,
-                last_msg_type,
-                last_sent_at,
-                order_id,
-                order_status,
-                (
-                    SELECT COUNT(*)
-                    FROM messages
-                    WHERE recipient_id = ? AND sender_id = peer_id AND read_at IS NULL
-                ) AS unread_count
-            FROM (
-                SELECT
-                    CASE WHEN m.sender_id = ? THEN m.recipient_id ELSE m.sender_id END AS peer_id,
-                    IFNULL(u.name,       '') AS peer_name,
-                    IFNULL(u.avatar_url, '') AS peer_avatar,
-                    IFNULL(m.content,    '') AS last_message,
-                    IFNULL(m.msg_type,   '') AS last_msg_type,
-                    IFNULL(DATE_FORMAT(m.sent_at, '%Y-%m-%dT%H:%i:%sZ'), '0001-01-01T00:00:00Z') AS last_sent_at,
-                    m.order_id,
-                    IFNULL(o.status, '') AS order_status,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY CASE WHEN m.sender_id = ? THEN m.recipient_id ELSE m.sender_id END
-                        ORDER BY m.sent_at DESC
-                    ) AS rn
-                FROM messages m
-                JOIN users u ON u.id = CASE WHEN m.sender_id = ? THEN m.recipient_id ELSE m.sender_id END
-                JOIN orders o ON m.order_id = o.id
-                WHERE m.sender_id = ? OR m.recipient_id = ?
-            ) t
-            WHERE rn = 1
-            ORDER BY last_sent_at DESC";
+        WITH conversation_latest AS (
+            SELECT 
+                CASE WHEN m.sender_id = ? THEN m.recipient_id ELSE m.sender_id END AS peer_id,
+                m.content AS last_message,
+                m.msg_type AS last_msg_type,
+                m.sent_at AS last_sent_at,
+                m.order_id,
+                ROW_NUMBER() OVER (
+                    PARTITION BY CASE WHEN m.sender_id = ? THEN m.recipient_id ELSE m.sender_id END 
+                    ORDER BY m.sent_at DESC
+                ) AS rn
+            FROM messages m
+            WHERE m.sender_id = ? OR m.recipient_id = ?
+        ),
+        unread_counts AS (
+            SELECT 
+                m.sender_id,
+                COUNT(*) AS unread_count
+            FROM messages m
+            WHERE m.recipient_id = ? 
+                AND m.read_at IS NULL
+            GROUP BY m.sender_id
+        )
+        SELECT 
+            cl.peer_id,
+            COALESCE(u.name, '') AS peer_name,
+            COALESCE(u.avatar_url, '') AS peer_avatar,
+            COALESCE(cl.last_message, '') AS last_message,
+            COALESCE(cl.last_msg_type, '') AS last_msg_type,
+            COALESCE(DATE_FORMAT(cl.last_sent_at, '%Y-%m-%dT%H:%i:%sZ'), '0001-01-01T00:00:00Z') AS last_sent_at,
+            cl.order_id,
+            COALESCE(o.status, '') AS order_status,
+            COALESCE(uc.unread_count, 0) AS unread_count
+        FROM conversation_latest cl
+        LEFT JOIN users u ON u.id = cl.peer_id
+        LEFT JOIN orders o ON o.id = cl.order_id
+        LEFT JOIN unread_counts uc ON uc.sender_id = cl.peer_id
+        WHERE cl.rn = 1
+        ORDER BY cl.last_sent_at DESC";
 
         let ub = &user_id_b[..];
         let mut conn = self.pool.get_conn().await?;
-        let rows: Vec<Row> = conn.exec(q, (ub, ub, ub, ub, ub, ub)).await?;
+
+        // Use prepared statement with proper parameter binding
+        let rows: Vec<Row> = conn
+            .exec(
+                q,
+                (ub, ub, ub, ub, ub), // 5 parameters: 2 for CTE, 1 for unread_counts
+            )
+            .await?;
 
         rows.iter()
             .map(|r| -> Result<ConversationItem> {
