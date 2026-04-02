@@ -293,10 +293,7 @@ impl ConnectionManager {
                     total += 1;
 
                     if count >= PRESENCE_BATCH_SIZE {
-                        if let Err(e) = pipe
-                            .query_async::<redis::aio::ConnectionManager, ()>(&mut conn)
-                            .await
-                        {
+                        if let Err(e) = pipe.query_async::<()>(&mut conn).await {
                             tracing::warn!("Presence batch flush failed: {}", e);
                         }
                         pipe = redis::pipe();
@@ -305,10 +302,7 @@ impl ConnectionManager {
                 }
 
                 if count > 0 {
-                    if let Err(e) = pipe
-                        .query_async::<redis::aio::ConnectionManager, ()>(&mut conn)
-                        .await
-                    {
+                    if let Err(e) = pipe.query_async::<()>(&mut conn).await {
                         tracing::warn!("Presence final flush failed: {}", e);
                     }
                 }
@@ -364,7 +358,7 @@ impl ConnectionManager {
                 format!("online:{}", user_id),
                 role,
                 redis::SetOptions::default()
-                    .with_expiration(redis::SetExpiry::EX(PRESENCE_TTL_SECS as usize))
+                    .with_expiration(redis::SetExpiry::EX(PRESENCE_TTL_SECS))
                     .conditional_set(redis::ExistenceCheck::NX),
             )
             .await
@@ -504,15 +498,15 @@ impl ConnectionManager {
 
     // ── Query ─────────────────────────────────────────────────────────────────
 
-    pub async fn is_connected(&self, user_id: &str) -> bool {
+    pub async fn is_connected(&self, user_id: &str) -> Result<bool> {
         if self.channels.contains_key(user_id) {
-            return true;
+            return Ok(true);
         }
         let mut redis = (*self.redis).clone();
-        redis
+        let exist = redis
             .exists::<_, bool>(format!("online:{}", user_id))
-            .await
-            .unwrap_or(false)
+            .await?;
+        Ok(exist)
     }
 
     pub fn online_drivers(&self) -> Vec<String> {

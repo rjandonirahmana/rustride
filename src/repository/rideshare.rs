@@ -1,11 +1,10 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use mysql_async::{from_value, Pool, Row};
+use deadpool_postgres::Pool;
+use tokio_postgres::Row;
 
-use super::db::{col, col_opt_f64, col_opt_i32, col_opt_str, exec_drop, exec_rows};
-use crate::utils::ulid::{bin_to_ulid, new_ulid, ulid_to_bytes};
-
-// ── Models ────────────────────────────────────────────────────────────────────
+use super::db::{col_opt_f64, col_opt_i32, col_opt_str, exec_drop, exec_rows};
+use crate::utils::ulid::{bin_to_ulid, id_to_vec, new_ulid, ulid_to_vec};
 
 #[derive(Debug, Clone)]
 pub struct RideshareTrip {
@@ -69,8 +68,6 @@ pub struct RideshareOpenItem {
     pub driver_rating: f64,
 }
 
-// ── Trait ─────────────────────────────────────────────────────────────────────
-
 #[async_trait]
 pub trait RideshareRepositoryTrait: Send + Sync {
     async fn create_trip(
@@ -121,8 +118,6 @@ pub trait RideshareRepositoryTrait: Send + Sync {
     async fn passenger_exists(&self, trip_id: &str, rider_id: &str) -> Result<bool>;
 }
 
-// ── MySQL implementasi ────────────────────────────────────────────────────────
-
 pub struct RideshareRepository {
     pool: Pool,
 }
@@ -133,67 +128,76 @@ impl RideshareRepository {
     }
 
     fn row_to_trip(row: &Row) -> Result<RideshareTrip> {
+        let id_bytes: Vec<u8> = row.try_get("id")?;
+        let order_bytes: Vec<u8> = row.try_get("host_order_id")?;
+        let driver_bytes: Vec<u8> = row.try_get("driver_id")?;
         Ok(RideshareTrip {
-            id: bin_to_ulid(from_value(col(row, "id")?))?,
-            host_order_id: bin_to_ulid(from_value(col(row, "host_order_id")?))?,
-            driver_id: bin_to_ulid(from_value(col(row, "driver_id")?))?,
-            service_type: from_value(col(row, "service_type")?),
-            route_start_lat: from_value(col(row, "route_start_lat")?),
-            route_start_lng: from_value(col(row, "route_start_lng")?),
-            route_end_lat: from_value(col(row, "route_end_lat")?),
-            route_end_lng: from_value(col(row, "route_end_lng")?),
-            route_polyline: col_opt_str(row, "route_polyline"),
-            max_passengers: from_value(col(row, "max_passengers")?),
-            current_passengers: from_value(col(row, "current_passengers")?),
-            status: from_value(col(row, "status")?),
-            join_deadline: col_opt_str(row, "join_deadline"),
-            created_at: from_value(col(row, "created_at")?),
+            id: bin_to_ulid(id_bytes)?,
+            host_order_id: bin_to_ulid(order_bytes)?,
+            driver_id: bin_to_ulid(driver_bytes)?,
+            service_type: row.try_get("service_type")?, // sudah TEXT dari ::TEXT cast
+            route_start_lat: row.try_get("route_start_lat")?,
+            route_start_lng: row.try_get("route_start_lng")?,
+            route_end_lat: row.try_get("route_end_lat")?,
+            route_end_lng: row.try_get("route_end_lng")?,
+            route_polyline: col_opt_str(row, "route_polyline")?,
+            max_passengers: row.try_get::<_, i16>("max_passengers")? as i32,
+            current_passengers: row.try_get::<_, i16>("current_passengers")? as i32,
+            status: row.try_get("status")?,
+            join_deadline: col_opt_str(row, "join_deadline")?,
+            created_at: row.try_get("created_at")?,
         })
     }
 
     fn row_to_passenger(row: &Row) -> Result<RidesharePassenger> {
+        let id_bytes: Vec<u8> = row.try_get("id")?;
+        let trip_bytes: Vec<u8> = row.try_get("trip_id")?;
+        let rider_bytes: Vec<u8> = row.try_get("rider_id")?;
         Ok(RidesharePassenger {
-            id: bin_to_ulid(from_value(col(row, "id")?))?,
-            trip_id: bin_to_ulid(from_value(col(row, "trip_id")?))?,
-            rider_id: bin_to_ulid(from_value(col(row, "rider_id")?))?,
-            pickup_lat: from_value(col(row, "pickup_lat")?),
-            pickup_lng: from_value(col(row, "pickup_lng")?),
-            pickup_address: from_value(col(row, "pickup_address")?),
-            dest_lat: from_value(col(row, "dest_lat")?),
-            dest_lng: from_value(col(row, "dest_lng")?),
-            dest_address: from_value(col(row, "dest_address")?),
-            fare_estimate: from_value(col(row, "fare_estimate")?),
+            id: bin_to_ulid(id_bytes)?,
+            trip_id: bin_to_ulid(trip_bytes)?,
+            rider_id: bin_to_ulid(rider_bytes)?,
+            pickup_lat: row.try_get("pickup_lat")?,
+            pickup_lng: row.try_get("pickup_lng")?,
+            pickup_address: row.try_get("pickup_address")?,
+            dest_lat: row.try_get("dest_lat")?,
+            dest_lng: row.try_get("dest_lng")?,
+            dest_address: row.try_get("dest_address")?,
+            fare_estimate: row.try_get("fare_estimate")?,
             fare_final: col_opt_i32(row, "fare_final"),
             distance_km: col_opt_f64(row, "distance_km"),
-            status: from_value(col(row, "status")?),
-            requested_at: from_value(col(row, "requested_at")?),
-            accepted_at: col_opt_str(row, "accepted_at"),
-            picked_up_at: col_opt_str(row, "picked_up_at"),
-            dropped_off_at: col_opt_str(row, "dropped_off_at"),
-            cancelled_at: col_opt_str(row, "cancelled_at"),
-            cancel_reason: col_opt_str(row, "cancel_reason"),
+            status: row.try_get("status")?,
+            requested_at: row.try_get("requested_at")?,
+            accepted_at: col_opt_str(row, "accepted_at")?,
+            picked_up_at: col_opt_str(row, "picked_up_at")?,
+            dropped_off_at: col_opt_str(row, "dropped_off_at")?,
+            cancelled_at: col_opt_str(row, "cancelled_at")?,
+            cancel_reason: col_opt_str(row, "cancel_reason")?,
         })
     }
 
     fn row_to_open_item(row: &Row) -> Result<RideshareOpenItem> {
+        let id_bytes: Vec<u8> = row.try_get("id")?;
+        let order_bytes: Vec<u8> = row.try_get("host_order_id")?;
+        let driver_bytes: Vec<u8> = row.try_get("driver_id")?;
         Ok(RideshareOpenItem {
-            id: bin_to_ulid(from_value(col(row, "id")?))?,
-            host_order_id: bin_to_ulid(from_value(col(row, "host_order_id")?))?,
-            driver_id: bin_to_ulid(from_value(col(row, "driver_id")?))?,
-            service_type: from_value(col(row, "service_type")?),
-            route_start_lat: from_value(col(row, "route_start_lat")?),
-            route_start_lng: from_value(col(row, "route_start_lng")?),
-            route_end_lat: from_value(col(row, "route_end_lat")?),
-            route_end_lng: from_value(col(row, "route_end_lng")?),
-            route_polyline: col_opt_str(row, "route_polyline"),
-            seats_available: from_value(col(row, "seats_available")?),
-            join_deadline: col_opt_str(row, "join_deadline"),
-            driver_name: from_value(col(row, "driver_name")?),
-            driver_avatar: col_opt_str(row, "driver_avatar"),
-            vehicle_plate: from_value(col(row, "vehicle_plate")?),
-            vehicle_model: from_value(col(row, "vehicle_model")?),
-            vehicle_color: from_value(col(row, "vehicle_color")?),
-            driver_rating: from_value(col(row, "driver_rating")?),
+            id: bin_to_ulid(id_bytes)?,
+            host_order_id: bin_to_ulid(order_bytes)?,
+            driver_id: bin_to_ulid(driver_bytes)?,
+            service_type: row.try_get("service_type")?,
+            route_start_lat: row.try_get("route_start_lat")?,
+            route_start_lng: row.try_get("route_start_lng")?,
+            route_end_lat: row.try_get("route_end_lat")?,
+            route_end_lng: row.try_get("route_end_lng")?,
+            route_polyline: col_opt_str(row, "route_polyline")?,
+            seats_available: row.try_get("seats_available")?,
+            join_deadline: col_opt_str(row, "join_deadline")?,
+            driver_name: row.try_get("driver_name")?,
+            driver_avatar: col_opt_str(row, "driver_avatar")?,
+            vehicle_plate: row.try_get("vehicle_plate")?,
+            vehicle_model: row.try_get("vehicle_model")?,
+            vehicle_color: row.try_get("vehicle_color")?,
+            driver_rating: row.try_get("driver_rating")?,
         })
     }
 }
@@ -213,78 +217,89 @@ impl RideshareRepositoryTrait for RideshareRepository {
         join_deadline_s: Option<i64>,
     ) -> Result<String> {
         let trip_id = new_ulid();
-        let trip_id_b = ulid_to_bytes(&trip_id)?;
-        let host_order_id_b = ulid_to_bytes(host_order_id)?;
-        let driver_id_b = ulid_to_bytes(driver_id)?;
+        let trip_b = ulid_to_vec(&trip_id)?;
+        let host_order_b = id_to_vec(host_order_id)?;
+        let driver_b = id_to_vec(driver_id)?;
+        let max_p = max_passengers as i16; // SMALLINT
 
         exec_drop(
             &self.pool,
-            r"INSERT INTO rideshare_trips
-                (id, host_order_id, driver_id, service_type,
-                 route_start_lat, route_start_lng, route_end_lat, route_end_lng,
-                 max_passengers, join_deadline)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
-                CASE WHEN ? IS NOT NULL THEN DATE_ADD(NOW(3), INTERVAL ? SECOND) ELSE NULL END)",
-            (
-                &trip_id_b[..],
-                &host_order_id_b[..],
-                &driver_id_b[..],
-                service_type,
-                start_lat,
-                start_lng,
-                end_lat,
-                end_lng,
-                max_passengers,
-                join_deadline_s,
-                join_deadline_s,
-            ),
+            r#"INSERT INTO rideshare_trips
+               (id, host_order_id, driver_id, service_type,
+                route_start_lat, route_start_lng, route_end_lat, route_end_lng,
+                max_passengers, join_deadline)
+               VALUES ($1,$2,$3,$4::text::vehicle_type,
+                       $5::FLOAT8::NUMERIC, $6::FLOAT8::NUMERIC,
+                       $7::FLOAT8::NUMERIC, $8::FLOAT8::NUMERIC,
+                       $9,
+                 CASE WHEN $10::BIGINT IS NOT NULL
+                      THEN NOW() + ($10 * INTERVAL '1 second')
+                      ELSE NULL END)"#,
+            &[
+                &trip_b,
+                &host_order_b,
+                &driver_b,
+                &service_type,
+                &start_lat,
+                &start_lng,
+                &end_lat,
+                &end_lng,
+                &max_p,
+                &join_deadline_s,
+            ],
         )
         .await?;
         Ok(trip_id)
     }
 
     async fn find_trip_by_id(&self, trip_id: &str) -> Result<Option<RideshareTrip>> {
-        let trip_id_b = ulid_to_bytes(trip_id)?;
-        let rows: Vec<Row> = exec_rows(
-            &self.pool,
-            r"SELECT id, host_order_id, driver_id, service_type,
-                     route_start_lat, route_start_lng, route_end_lat, route_end_lng,
-                     route_polyline, max_passengers, current_passengers, status,
-                     join_deadline, created_at
-              FROM rideshare_trips WHERE id = ?",
-            (&trip_id_b[..],),
-        )
-        .await?;
-        rows.first().map(Self::row_to_trip).transpose()
+        let trip_b = id_to_vec(trip_id)?;
+        let rows = exec_rows(&self.pool,
+            r#"SELECT id, host_order_id, driver_id,
+                      service_type::TEXT AS service_type,
+                      route_start_lat::FLOAT8, route_start_lng::FLOAT8,
+                      route_end_lat::FLOAT8,   route_end_lng::FLOAT8,
+                      route_polyline, max_passengers, current_passengers, status,
+                      to_char(join_deadline AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS join_deadline,
+                      to_char(created_at   AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
+               FROM rideshare_trips WHERE id = $1"#,
+            &[&trip_b]).await?;
+        rows.into_iter()
+            .next()
+            .map(|r| Self::row_to_trip(&r))
+            .transpose()
     }
 
     async fn find_trip_by_order(&self, order_id: &str) -> Result<Option<RideshareTrip>> {
-        let order_id_b = ulid_to_bytes(order_id)?;
-        let rows: Vec<Row> = exec_rows(
-            &self.pool,
-            r"SELECT id, host_order_id, driver_id, service_type,
-                     route_start_lat, route_start_lng, route_end_lat, route_end_lng,
-                     route_polyline, max_passengers, current_passengers, status,
-                     join_deadline, created_at
-              FROM rideshare_trips WHERE host_order_id = ?",
-            (&order_id_b[..],),
-        )
-        .await?;
-        rows.first().map(Self::row_to_trip).transpose()
+        let order_b = id_to_vec(order_id)?;
+        let rows = exec_rows(&self.pool,
+            r#"SELECT id, host_order_id, driver_id,
+                      service_type::TEXT AS service_type,
+                      route_start_lat::FLOAT8, route_start_lng::FLOAT8,
+                      route_end_lat::FLOAT8,   route_end_lng::FLOAT8,
+                      route_polyline, max_passengers, current_passengers, status,
+                      to_char(join_deadline AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS join_deadline,
+                      to_char(created_at   AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
+               FROM rideshare_trips WHERE host_order_id = $1"#,
+            &[&order_b]).await?;
+        rows.into_iter()
+            .next()
+            .map(|r| Self::row_to_trip(&r))
+            .transpose()
     }
 
     async fn update_trip_status(&self, trip_id: &str, status: &str) -> Result<()> {
-        let trip_id_b = ulid_to_bytes(trip_id)?;
+        let trip_b = id_to_vec(trip_id)?;
         let extra = match status {
-            "in_progress" => ", started_at = NOW(3)",
-            "completed" => ", completed_at = NOW(3)",
+            "in_progress" => ", started_at = NOW()",
+            "completed" => ", completed_at = NOW()",
             _ => "",
         };
         let sql = format!(
-            "UPDATE rideshare_trips SET status = ?{} WHERE id = ?",
+            "UPDATE rideshare_trips SET status = $1{} WHERE id = $2",
             extra
         );
-        exec_drop(&self.pool, &sql, (status, &trip_id_b[..])).await
+        exec_drop(&self.pool, &sql, &[&status, &trip_b]).await
     }
 
     async fn list_open_trips(
@@ -295,22 +310,26 @@ impl RideshareRepositoryTrait for RideshareRepository {
         min_lng: f64,
         max_lng: f64,
     ) -> Result<Vec<RideshareOpenItem>> {
-        let rows: Vec<Row> = exec_rows(
-            &self.pool,
-            r"SELECT id, host_order_id, driver_id, service_type,
-                     route_start_lat, route_start_lng, route_end_lat, route_end_lng,
-                     route_polyline, seats_available, join_deadline,
-                     driver_name, driver_avatar,
-                     vehicle_plate, vehicle_model, vehicle_color, driver_rating
-              FROM rideshare_trips_open
-              WHERE service_type = ?
-                AND route_start_lat BETWEEN ? AND ?
-                AND route_start_lng BETWEEN ? AND ?
-                AND seats_available > 0
-              ORDER BY id DESC LIMIT 50",
-            (service_type, min_lat, max_lat, min_lng, max_lng),
-        )
-        .await?;
+        // Pakai view rideshare_trips_open yang ada di schema
+        // service_type di view sudah vehicle_type ENUM — cast ke TEXT untuk compare
+        let rows = exec_rows(&self.pool,
+            r#"SELECT id, host_order_id, driver_id,
+                      service_type::TEXT AS service_type,
+                      route_start_lat::FLOAT8, route_start_lng::FLOAT8,
+                      route_end_lat::FLOAT8,   route_end_lng::FLOAT8,
+                      route_polyline,
+                      seats_available::BIGINT,
+                      to_char(join_deadline AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS join_deadline,
+                      driver_name, driver_avatar,
+                      vehicle_plate, vehicle_model, vehicle_color,
+                      driver_rating::FLOAT8
+               FROM rideshare_trips_open
+               WHERE service_type::TEXT = $1
+                 AND route_start_lat::FLOAT8 BETWEEN $2 AND $3
+                 AND route_start_lng::FLOAT8 BETWEEN $4 AND $5
+                 AND seats_available > 0
+               ORDER BY id DESC LIMIT 50"#,
+            &[&service_type, &min_lat, &max_lat, &min_lng, &max_lng]).await?;
         rows.iter().map(Self::row_to_open_item).collect()
     }
 
@@ -327,65 +346,71 @@ impl RideshareRepositoryTrait for RideshareRepository {
         fare_estimate: i32,
     ) -> Result<String> {
         let passenger_id = new_ulid();
-        let passenger_id_b = ulid_to_bytes(&passenger_id)?;
-        let trip_id_b = ulid_to_bytes(trip_id)?;
-        let rider_id_b = ulid_to_bytes(rider_id)?;
-
+        let passenger_b = ulid_to_vec(&passenger_id)?;
+        let trip_b = id_to_vec(trip_id)?;
+        let rider_b = id_to_vec(rider_id)?;
         exec_drop(
             &self.pool,
-            r"INSERT INTO rideshare_passengers
-                (id, trip_id, rider_id,
-                 pickup_lat, pickup_lng, pickup_address,
-                 dest_lat, dest_lng, dest_address, fare_estimate)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                &passenger_id_b[..],
-                &trip_id_b[..],
-                &rider_id_b[..],
-                pickup_lat,
-                pickup_lng,
-                pickup_address,
-                dest_lat,
-                dest_lng,
-                dest_address,
-                fare_estimate,
-            ),
+            r#"INSERT INTO rideshare_passengers
+               (id, trip_id, rider_id, pickup_lat, pickup_lng, pickup_address,
+                dest_lat, dest_lng, dest_address, fare_estimate)
+               VALUES ($1,$2,$3,
+                       $4::FLOAT8::NUMERIC, $5::FLOAT8::NUMERIC, $6,
+                       $7::FLOAT8::NUMERIC, $8::FLOAT8::NUMERIC, $9,
+                       $10)"#,
+            &[
+                &passenger_b,
+                &trip_b,
+                &rider_b,
+                &pickup_lat,
+                &pickup_lng,
+                &pickup_address,
+                &dest_lat,
+                &dest_lng,
+                &dest_address,
+                &fare_estimate,
+            ],
         )
         .await?;
         Ok(passenger_id)
     }
 
     async fn find_passenger_by_id(&self, passenger_id: &str) -> Result<Option<RidesharePassenger>> {
-        let passenger_id_b = ulid_to_bytes(passenger_id)?;
-        let rows: Vec<Row> = exec_rows(
-            &self.pool,
-            r"SELECT id, trip_id, rider_id,
-                     pickup_lat, pickup_lng, pickup_address,
-                     dest_lat, dest_lng, dest_address,
-                     fare_estimate, fare_final, distance_km, status,
-                     requested_at, accepted_at, picked_up_at, dropped_off_at,
-                     cancelled_at, cancel_reason
-              FROM rideshare_passengers WHERE id = ?",
-            (&passenger_id_b[..],),
-        )
-        .await?;
-        rows.first().map(Self::row_to_passenger).transpose()
+        let p_b = id_to_vec(passenger_id)?;
+        let rows = exec_rows(&self.pool,
+            r#"SELECT id, trip_id, rider_id,
+                      pickup_lat::FLOAT8, pickup_lng::FLOAT8, pickup_address,
+                      dest_lat::FLOAT8,   dest_lng::FLOAT8,   dest_address,
+                      fare_estimate, fare_final, distance_km::FLOAT8, status,
+                      to_char(requested_at   AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS requested_at,
+                      to_char(accepted_at    AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS accepted_at,
+                      to_char(picked_up_at   AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS picked_up_at,
+                      to_char(dropped_off_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS dropped_off_at,
+                      to_char(cancelled_at   AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS cancelled_at,
+                      cancel_reason
+               FROM rideshare_passengers WHERE id = $1"#,
+            &[&p_b]).await?;
+        rows.into_iter()
+            .next()
+            .map(|r| Self::row_to_passenger(&r))
+            .transpose()
     }
 
     async fn list_passengers(&self, trip_id: &str) -> Result<Vec<RidesharePassenger>> {
-        let trip_id_b = ulid_to_bytes(trip_id)?;
-        let rows: Vec<Row> = exec_rows(
-            &self.pool,
-            r"SELECT id, trip_id, rider_id,
-                     pickup_lat, pickup_lng, pickup_address,
-                     dest_lat, dest_lng, dest_address,
-                     fare_estimate, fare_final, distance_km, status,
-                     requested_at, accepted_at, picked_up_at, dropped_off_at,
-                     cancelled_at, cancel_reason
-              FROM rideshare_passengers WHERE trip_id = ?",
-            (&trip_id_b[..],),
-        )
-        .await?;
+        let trip_b = id_to_vec(trip_id)?;
+        let rows = exec_rows(&self.pool,
+            r#"SELECT id, trip_id, rider_id,
+                      pickup_lat::FLOAT8, pickup_lng::FLOAT8, pickup_address,
+                      dest_lat::FLOAT8,   dest_lng::FLOAT8,   dest_address,
+                      fare_estimate, fare_final, distance_km::FLOAT8, status,
+                      to_char(requested_at   AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS requested_at,
+                      to_char(accepted_at    AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS accepted_at,
+                      to_char(picked_up_at   AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS picked_up_at,
+                      to_char(dropped_off_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS dropped_off_at,
+                      to_char(cancelled_at   AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS cancelled_at,
+                      cancel_reason
+               FROM rideshare_passengers WHERE trip_id = $1"#,
+            &[&trip_b]).await?;
         rows.iter().map(Self::row_to_passenger).collect()
     }
 
@@ -397,17 +422,16 @@ impl RideshareRepositoryTrait for RideshareRepository {
         fare_final: Option<i32>,
         distance_km: Option<f64>,
     ) -> Result<()> {
-        let passenger_id_b = ulid_to_bytes(passenger_id)?;
-
+        let p_b = id_to_vec(passenger_id)?;
         exec_drop(
             &self.pool,
-            r"UPDATE rideshare_passengers
-              SET status        = ?,
-                  cancel_reason = COALESCE(?, cancel_reason),
-                  fare_final    = COALESCE(?, fare_final),
-                  distance_km   = COALESCE(?, distance_km)
-              WHERE id = ?",
-            (status, reason, fare_final, distance_km, &passenger_id_b[..]),
+            r#"UPDATE rideshare_passengers
+               SET status        = $1,
+                   cancel_reason = COALESCE($2, cancel_reason),
+                   fare_final    = COALESCE($3, fare_final),
+                   distance_km   = COALESCE($4::FLOAT8::NUMERIC, distance_km)
+               WHERE id = $5"#,
+            &[&status, &reason, &fare_final, &distance_km, &p_b],
         )
         .await?;
 
@@ -418,30 +442,30 @@ impl RideshareRepositoryTrait for RideshareRepository {
             "cancelled" | "rejected" => Some("cancelled_at"),
             _ => None,
         };
-        if let Some(col_name) = ts_col {
+        if let Some(col) = ts_col {
             let sql = format!(
-                "UPDATE rideshare_passengers SET {} = NOW(3) WHERE id = ?",
-                col_name
+                "UPDATE rideshare_passengers SET {} = NOW() WHERE id = $1",
+                col
             );
-            exec_drop(&self.pool, &sql, (&passenger_id_b[..],)).await?;
+            exec_drop(&self.pool, &sql, &[&p_b]).await?;
         }
         Ok(())
     }
 
     async fn passenger_exists(&self, trip_id: &str, rider_id: &str) -> Result<bool> {
-        let trip_id_b = ulid_to_bytes(trip_id)?;
-        let rider_id_b = ulid_to_bytes(rider_id)?;
-        let rows: Vec<Row> = exec_rows(
+        let trip_b = id_to_vec(trip_id)?;
+        let rider_b = id_to_vec(rider_id)?;
+        let rows = exec_rows(
             &self.pool,
-            r"SELECT COUNT(*) AS cnt FROM rideshare_passengers
-              WHERE trip_id = ? AND rider_id = ?
-                AND status NOT IN ('rejected','cancelled')",
-            (&trip_id_b[..], &rider_id_b[..]),
+            r#"SELECT COUNT(*)::BIGINT AS cnt FROM rideshare_passengers
+               WHERE trip_id = $1 AND rider_id = $2
+                 AND status NOT IN ('rejected','cancelled')"#,
+            &[&trip_b, &rider_b],
         )
         .await?;
         let cnt: i64 = rows
             .first()
-            .map(|r| from_value(col(r, "cnt").unwrap()))
+            .and_then(|r| r.try_get("cnt").ok())
             .unwrap_or(0);
         Ok(cnt > 0)
     }

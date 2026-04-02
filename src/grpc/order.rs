@@ -72,7 +72,7 @@ impl<OR: OrderRepository + 'static, UR: UserRepository + 'static> OrderServiceGr
                 &inner.service_type,
             )
             .await
-            .map_err(|e| Status::internal(format!("CREATE_FAILED: {e}")))?;
+            .map_err(|e| Status::internal(format!("CREATE_FAILED ERRORR: {:?}", e)))?;
 
         Ok(Response::new(OrderCreatedEvent {
             order_id: order.id,
@@ -116,7 +116,7 @@ impl<OR: OrderRepository + 'static, UR: UserRepository + 'static> OrderServiceGr
                 .ok()
                 .flatten()
                 .map(|(user, profile)| DriverInfo {
-                    user_id: driver_id.clone(),
+                    user_id: driver_id.to_string(),
                     name: user.name,
                     phone: user.phone,
                     vehicle_plate: profile.vehicle_plate,
@@ -228,7 +228,18 @@ pub async fn handle_watch_user<OR, UR, RR, NR>(
     RR: RideshareRepositoryTrait + 'static,
     NR: NotificationRepositoryTrait + 'static,
 {
-    let online = ctx.connections.is_connected(&req.target_user_id).await;
+    let online = match ctx.connections.is_connected(&req.target_user_id).await {
+        Ok(on) => on,
+        Err(e) => {
+            tracing::error!(
+                user_id = req.target_user_id,
+                "Error checking user presence: {}",
+                e
+            );
+            false
+        }
+    };
+
     ctx.send(
         Sp::Presence(PresenceEvent {
             user_id: req.target_user_id,

@@ -1,33 +1,39 @@
 use anyhow::Result;
-use mysql_async::Value;
 use ulid::Ulid;
-// ── ULID helpers ──────────────────────────────────────────────────────────────
 
-/// Generate ULID baru sebagai display string (26 char Crockford base32).
-/// Dipakai di service layer — model.id tetap String.
-/// Konversi ke [u8; 16] terjadi di repo layer saat INSERT/WHERE.
 pub fn new_ulid() -> String {
     Ulid::new().to_string()
 }
 
-/// Konversi ULID string → [u8; 16] untuk parameter DB (BINARY(16)).
-/// Dipakai di repo layer sebelum exec_drop / exec_rows.
 pub fn ulid_to_bytes(s: &str) -> Result<[u8; 16]> {
     s.parse::<Ulid>()
         .map(|u| u.to_bytes())
         .map_err(|e| anyhow::anyhow!("Invalid ULID '{}': {}", s, e))
 }
 
-/// Konversi bytes dari DB (BINARY(16)) → ULID display string.
-/// Dipakai di repo layer saat row mapper.
-pub fn bytes_to_ulid(b: Vec<u8>) -> Result<String> {
-    let arr: [u8; 16] = b
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("Expected 16 bytes for ULID"))?;
-    Ok(Ulid::from_bytes(arr).to_string())
+/// Untuk bind ke tokio-postgres BYTEA parameter.
+/// Kembalikan Vec<u8> — bisa deref ke &[u8] yang impl ToSql.
+pub fn ulid_to_vec(s: &str) -> Result<Vec<u8>> {
+    ulid_to_bytes(s).map(|b| b.to_vec())
 }
 
-/// Konversi Vec<u8> (16 bytes dari BINARY(16)) → ULID display string
+/// Handle kedua format id:
+///   - ULID 26 char  (misal "01ARZ3NDEKTSV4RRFFQ69G5FAV") → parse via ulid_to_vec
+///   - Hex  32 char  (misal "019d4942f47000ee70983c1090bc616b") → decode via hex::decode
+///
+/// Gunakan ini di repository yang menerima id dari JWT / request luar.
+pub fn id_to_vec(s: &str) -> Result<Vec<u8>> {
+    match s.len() {
+        26 => ulid_to_vec(s),
+        32 => hex::decode(s).map_err(|e| anyhow::anyhow!("Invalid hex id '{}': {}", s, e)),
+        n => anyhow::bail!(
+            "Invalid id '{}': expected 26-char ULID or 32-char hex, got {} chars",
+            s,
+            n
+        ),
+    }
+}
+
 pub fn bin_to_ulid(raw: Vec<u8>) -> Result<String> {
     let arr: [u8; 16] = raw
         .try_into()
@@ -35,16 +41,12 @@ pub fn bin_to_ulid(raw: Vec<u8>) -> Result<String> {
     Ok(Ulid::from_bytes(arr).to_string())
 }
 
-/// Sama tapi untuk kolom nullable — Value::NULL → None
-pub fn bin_to_ulid_opt(val: Value) -> Result<Option<String>> {
+pub fn bin_to_ulid_opt(val: Option<Vec<u8>>) -> Result<Option<String>> {
     match val {
-        Value::NULL => Ok(None),
-        Value::Bytes(b) => Ok(Some(bin_to_ulid(b)?)),
-        other => anyhow::bail!("Unexpected value type for nullable BINARY(16): {:?}", other),
+        None => Ok(None),
+        Some(b) => Ok(Some(bin_to_ulid(b)?)),
     }
 }
-
-// ── Mime helpers ──────────────────────────────────────────────────────────────
 
 pub fn mime_to_type(mime: &str) -> &'static str {
     if mime.starts_with("image/") {

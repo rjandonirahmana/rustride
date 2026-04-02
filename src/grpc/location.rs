@@ -31,6 +31,15 @@ pub async fn handle_location_update<OR, UR, RR, NR>(
         return;
     }
 
+    tracing::info!(
+        driver = %ctx.user_id,
+        lat = loc.lat,
+        lng = loc.lng,
+        heading = loc.heading,
+        speed = loc.speed,
+        "Received location update"
+    );
+
     // Throttle: heartbeat tidak perlu lebih dari 1x/detik
     if !ctx
         .throttle
@@ -38,6 +47,14 @@ pub async fn handle_location_update<OR, UR, RR, NR>(
     {
         return; // Silently drop — client tidak perlu tahu
     }
+
+    tracing::info!(
+        driver = %ctx.user_id,
+        vehicle_type = %ctx.vehicle_type,
+        lat = loc.lat,
+        lng = loc.lng,
+        "Location update lolos throttle, update Redis"
+    );
 
     if let Err(e) = ctx
         .location
@@ -51,9 +68,16 @@ pub async fn handle_location_update<OR, UR, RR, NR>(
         )
         .await
     {
+        tracing::error!(driver = %ctx.user_id, error = %e, "update_driver_location GAGAL");
         ctx.send_err("LOC_UPDATE_FAILED", &e.to_string());
         return;
     }
+
+    tracing::info!(
+        driver = %ctx.user_id,
+        vehicle_type = %ctx.vehicle_type,
+        "Driver berhasil masuk geo:ready di Redis"
+    );
 
     // Forward lokasi ke rider jika sedang dalam order aktif
     match ctx

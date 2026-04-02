@@ -76,7 +76,7 @@ message PingReq          {}
 
 message PongEvent        {}
 
-message ConnectedEvent   { string user_id = 1; string role = 2; string username = 3; }
+message ConnectedEvent   { string user_id = 1; string role = 2; string username = 3; string vehicle_type = 4; }
 
 message ErrorEvent       { string code = 1; string message = 2; }
 

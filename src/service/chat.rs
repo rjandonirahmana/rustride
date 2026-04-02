@@ -19,8 +19,8 @@ pub struct ChatService {
     pub msg_repo: Arc<MessageRepository>,
     pub connections: Arc<ConnectionManager>,
     pub s3_client: Arc<aws_sdk_s3::Client>,
-    pub r2_public_url: &'static str,
-    pub r2_bucket: &'static str,
+    pub r2_public_url: String,
+    pub r2_bucket: String,
 }
 
 impl ChatService {
@@ -129,7 +129,7 @@ impl ChatService {
         let presigned = self
             .s3_client
             .put_object()
-            .bucket(self.r2_bucket)
+            .bucket(&self.r2_bucket)
             .key(&key)
             .content_type(mime)
             .presigned(PresigningConfig::expires_in(Duration::from_secs(300))?)
@@ -207,8 +207,13 @@ impl ChatService {
             Priority::Critical,
         );
 
-        if self.connections.is_connected(&msg.recipient_id).await {
-            let _ = self.msg_repo.mark_delivered(&msg.id).await;
+        match self.connections.is_connected(&msg.recipient_id).await {
+            Ok(_) => {
+                let _ = self.msg_repo.mark_delivered(&msg.id).await;
+            }
+            Err(e) => {
+                tracing::info!("errror {:?}", e)
+            }
         }
     }
 }

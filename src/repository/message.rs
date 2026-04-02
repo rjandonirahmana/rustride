@@ -1,8 +1,9 @@
 use anyhow::Result;
-use mysql_async::{from_value, prelude::Queryable, Pool, Row};
+use deadpool_postgres::Pool;
+use tokio_postgres::Row;
 
-use super::db::{col, col_opt_i32, col_opt_i64, col_opt_str, exec_drop, exec_rows};
-use crate::utils::ulid::{bin_to_ulid, ulid_to_bytes};
+use super::db::{col_opt_i32, col_opt_i64, col_opt_str, exec_drop, exec_rows, get_conn};
+use crate::utils::ulid::{bin_to_ulid, bin_to_ulid_opt, id_to_vec, ulid_to_vec};
 use crate::{models::message::Message, proto::message::ConversationItem};
 
 pub struct MessageRepository {
@@ -14,137 +15,140 @@ impl MessageRepository {
         Self { pool }
     }
 
+    // to_char → ISO8601, COALESCE untuk nullable timestamps
     fn msg_cols() -> &'static str {
-        r"m.id, m.sender_id, m.recipient_id, m.content, m.msg_type, m.order_id,
-          m.media_url, m.media_mime, m.media_size, m.media_duration, m.media_thumb,
-          IFNULL(DATE_FORMAT(m.sent_at,       '%Y-%m-%dT%H:%i:%sZ'), '0001-01-01T00:00:00Z') AS sent_at,
-          IFNULL(DATE_FORMAT(m.delivered_at,  '%Y-%m-%dT%H:%i:%sZ'), '0001-01-01T00:00:00Z') AS delivered_at,
-          IFNULL(DATE_FORMAT(m.read_at,       '%Y-%m-%dT%H:%i:%sZ'), '0001-01-01T00:00:00Z') AS read_at,
-          u.name       AS sender_name,
-          u.avatar_url AS sender_avatar,
-          IFNULL(o.status, '') AS status_order"
+        r#"m.id, m.sender_id, m.recipient_id, m.content, m.msg_type, m.order_id,
+           m.media_url, m.media_mime, m.media_size, m.media_duration, m.media_thumb,
+           COALESCE(to_char(m.sent_at      AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), '0001-01-01T00:00:00Z') AS sent_at,
+           COALESCE(to_char(m.delivered_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), '0001-01-01T00:00:00Z') AS delivered_at,
+           COALESCE(to_char(m.read_at      AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), '0001-01-01T00:00:00Z') AS read_at,
+           u.name       AS sender_name,
+           u.avatar_url AS sender_avatar,
+           COALESCE(o.status, '') AS status_order"#
     }
 
     fn row_to_message(row: &Row) -> Result<Message> {
+        let id_bytes: Vec<u8> = row.try_get("id")?;
+        let sender_bytes: Vec<u8> = row.try_get("sender_id")?;
+        let recipient_bytes: Vec<u8> = row.try_get("recipient_id")?;
+        let order_bytes: Vec<u8> = row.try_get("order_id")?;
+
         Ok(Message {
-            id: bin_to_ulid(from_value(col(row, "id")?))?,
-            sender_id: bin_to_ulid(from_value(col(row, "sender_id")?))?,
-            recipient_id: bin_to_ulid(from_value(col(row, "recipient_id")?))?,
-            order_id: bin_to_ulid(from_value(col(row, "order_id")?))?,
-            content: from_value(col(row, "content")?),
-            msg_type: from_value(col(row, "msg_type")?),
-            media_url: col_opt_str(row, "media_url"),
-            media_mime: col_opt_str(row, "media_mime"),
+            id: bin_to_ulid(id_bytes)?,
+            sender_id: bin_to_ulid(sender_bytes)?,
+            recipient_id: bin_to_ulid(recipient_bytes)?,
+            order_id: bin_to_ulid(order_bytes)?,
+            content: row.try_get("content")?,
+            msg_type: row.try_get("msg_type")?,
+            media_url: col_opt_str(row, "media_url")?,
+            media_mime: col_opt_str(row, "media_mime")?,
             media_size: col_opt_i64(row, "media_size"),
             media_duration: col_opt_i32(row, "media_duration"),
-            media_thumb: col_opt_str(row, "media_thumb"),
-            sent_at: from_value(col(row, "sent_at")?),
-            delivered_at: col_opt_str(row, "delivered_at"),
-            read_at: col_opt_str(row, "read_at"),
-            sender_name: col_opt_str(row, "sender_name"),
-            sender_avatar: col_opt_str(row, "sender_avatar"),
-            status_order: col_opt_str(row, "status_order"),
+            media_thumb: col_opt_str(row, "media_thumb")?,
+            sent_at: row.try_get("sent_at")?,
+            delivered_at: col_opt_str(row, "delivered_at")?,
+            read_at: col_opt_str(row, "read_at")?,
+            sender_name: col_opt_str(row, "sender_name")?,
+            sender_avatar: col_opt_str(row, "sender_avatar")?,
+            status_order: col_opt_str(row, "status_order")?,
         })
     }
 
     pub async fn save(&self, msg: &mut Message) -> Result<()> {
-        let id_b = ulid_to_bytes(&msg.id)?;
-        let sender_b = ulid_to_bytes(&msg.sender_id)?;
-        let recipient_b = ulid_to_bytes(&msg.recipient_id)?;
-        let order_b = ulid_to_bytes(&msg.order_id)?;
+        let id_b = ulid_to_vec(&msg.id)?;
+        let sender_b = id_to_vec(&msg.sender_id)?;
+        let recipient_b = id_to_vec(&msg.recipient_id)?;
+        let order_b = id_to_vec(&msg.order_id)?;
 
+        // tokio-postgres tidak bisa bind &str ke TIMESTAMPTZ.
+        // sent_at di-set DEFAULT (NOW()) sehingga tidak perlu di-bind.
         exec_drop(
             &self.pool,
-            r"INSERT INTO messages
-              (id, sender_id, recipient_id, order_id, content, msg_type,
-               media_url, media_mime, media_size, media_duration, media_thumb, sent_at)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                &id_b[..],
-                &sender_b[..],
-                &recipient_b[..],
-                &order_b[..],
-                &msg.content,
-                &msg.msg_type,
-                &msg.media_url,
-                &msg.media_mime,
-                msg.media_size,
-                msg.media_duration,
-                &msg.media_thumb,
-                &msg.sent_at,
-            ),
+            r#"INSERT INTO messages
+               (id, sender_id, recipient_id, order_id, content, msg_type,
+                media_url, media_mime, media_size, media_duration, media_thumb)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)"#,
+            &[
+                &id_b,
+                &sender_b,
+                &recipient_b,
+                &order_b,
+                &msg.content.as_str(),
+                &msg.msg_type.as_str(),
+                &msg.media_url.as_deref(),
+                &msg.media_mime.as_deref(),
+                &msg.media_size,
+                &msg.media_duration,
+                &msg.media_thumb.as_deref(),
+            ],
         )
         .await
     }
 
     pub async fn get_conversations(&self, user_id: &str) -> Result<Vec<ConversationItem>> {
-        let user_id_b = ulid_to_bytes(user_id)?;
+        let user_b = id_to_vec(user_id)?;
 
-        // Optimized query with better performance
-        let q = r"
+        // PostgreSQL CTE — WITH clause: DISTINCT ON lebih efisien dari ROW_NUMBER() di Postgres
+        let q = r#"
         WITH conversation_latest AS (
-            SELECT 
-                CASE WHEN m.sender_id = ? THEN m.recipient_id ELSE m.sender_id END AS peer_id,
-                m.content AS last_message,
+            SELECT DISTINCT ON (
+                CASE WHEN m.sender_id = $1 THEN m.recipient_id ELSE m.sender_id END
+            )
+                CASE WHEN m.sender_id = $1 THEN m.recipient_id ELSE m.sender_id END AS peer_id,
+                m.content  AS last_message,
                 m.msg_type AS last_msg_type,
-                m.sent_at AS last_sent_at,
-                m.order_id,
-                ROW_NUMBER() OVER (
-                    PARTITION BY CASE WHEN m.sender_id = ? THEN m.recipient_id ELSE m.sender_id END 
-                    ORDER BY m.sent_at DESC
-                ) AS rn
+                m.sent_at  AS last_sent_at,
+                m.order_id
             FROM messages m
-            WHERE m.sender_id = ? OR m.recipient_id = ?
+            WHERE m.sender_id = $1 OR m.recipient_id = $1
+            ORDER BY
+                CASE WHEN m.sender_id = $1 THEN m.recipient_id ELSE m.sender_id END,
+                m.sent_at DESC
         ),
         unread_counts AS (
-            SELECT 
-                m.sender_id,
-                COUNT(*) AS unread_count
-            FROM messages m
-            WHERE m.recipient_id = ? 
-                AND m.read_at IS NULL
-            GROUP BY m.sender_id
+            SELECT sender_id, COUNT(*) AS unread_count
+            FROM messages
+            WHERE recipient_id = $1 AND read_at IS NULL
+            GROUP BY sender_id
         )
-        SELECT 
+        SELECT
             cl.peer_id,
-            COALESCE(u.name, '') AS peer_name,
+            COALESCE(u.name, '')       AS peer_name,
             COALESCE(u.avatar_url, '') AS peer_avatar,
             COALESCE(cl.last_message, '') AS last_message,
             COALESCE(cl.last_msg_type, '') AS last_msg_type,
-            COALESCE(DATE_FORMAT(cl.last_sent_at, '%Y-%m-%dT%H:%i:%sZ'), '0001-01-01T00:00:00Z') AS last_sent_at,
+            COALESCE(
+                to_char(cl.last_sent_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+                '0001-01-01T00:00:00Z'
+            ) AS last_sent_at,
             cl.order_id,
-            COALESCE(o.status, '') AS order_status,
+            COALESCE(o.status, '')     AS order_status,
             COALESCE(uc.unread_count, 0) AS unread_count
         FROM conversation_latest cl
-        LEFT JOIN users u ON u.id = cl.peer_id
-        LEFT JOIN orders o ON o.id = cl.order_id
+        LEFT JOIN users  u  ON u.id  = cl.peer_id
+        LEFT JOIN orders o  ON o.id  = cl.order_id
         LEFT JOIN unread_counts uc ON uc.sender_id = cl.peer_id
-        WHERE cl.rn = 1
-        ORDER BY cl.last_sent_at DESC";
+        ORDER BY cl.last_sent_at DESC
+        "#;
 
-        let ub = &user_id_b[..];
-        let mut conn = self.pool.get_conn().await?;
-
-        // Use prepared statement with proper parameter binding
-        let rows: Vec<Row> = conn
-            .exec(
-                q,
-                (ub, ub, ub, ub, ub), // 5 parameters: 2 for CTE, 1 for unread_counts
-            )
-            .await?;
+        let conn = get_conn(&self.pool).await?;
+        let rows = conn.query(q, &[&user_b]).await?;
 
         rows.iter()
             .map(|r| -> Result<ConversationItem> {
+                let peer_bytes: Vec<u8> = r.try_get("peer_id")?;
+                let order_bytes: Vec<u8> = r.try_get("order_id")?;
+                let unread: i64 = r.try_get("unread_count")?;
                 Ok(ConversationItem {
-                    peer_id: bin_to_ulid(from_value(col(r, "peer_id")?))?,
-                    peer_name: from_value(col(r, "peer_name")?),
-                    peer_avatar: from_value(col(r, "peer_avatar")?),
-                    last_message: from_value(col(r, "last_message")?),
-                    last_message_type: from_value(col(r, "last_msg_type")?),
-                    last_seen_at: from_value(col(r, "last_sent_at")?),
-                    unread_count: from_value(col(r, "unread_count")?),
-                    order_id: bin_to_ulid(from_value(col(r, "order_id")?))?,
-                    order_status: from_value(col(r, "order_status")?),
+                    peer_id: bin_to_ulid(peer_bytes)?,
+                    peer_name: r.try_get("peer_name")?,
+                    peer_avatar: r.try_get("peer_avatar")?,
+                    last_message: r.try_get("last_message")?,
+                    last_message_type: r.try_get("last_msg_type")?,
+                    last_seen_at: r.try_get("last_sent_at")?,
+                    unread_count: unread as u32,
+                    order_id: bin_to_ulid(order_bytes)?,
+                    order_status: r.try_get("order_status")?,
                 })
             })
             .collect()
@@ -157,57 +161,47 @@ impl MessageRepository {
         limit: i32,
         _before_id: Option<&str>,
     ) -> Result<Vec<Message>> {
-        let sender_b = ulid_to_bytes(sender_id)?;
-        let reader_b = ulid_to_bytes(reader_id)?;
+        let sender_b = id_to_vec(sender_id)?;
+        let reader_b = id_to_vec(reader_id)?;
 
         let q = format!(
-            r"SELECT {} FROM messages m
-              JOIN users u ON m.sender_id = u.id
-              JOIN orders o ON m.order_id = o.id
-              WHERE (m.sender_id = ? AND m.recipient_id = ?)
-                 OR (m.sender_id = ? AND m.recipient_id = ?)
-              ORDER BY m.sent_at DESC
-              LIMIT ?",
-            Self::msg_cols()
+            r#"SELECT {cols}
+               FROM messages m
+               JOIN users u ON m.sender_id = u.id
+               JOIN orders o ON m.order_id = o.id
+               WHERE (m.sender_id = $1 AND m.recipient_id = $2)
+                  OR (m.sender_id = $2 AND m.recipient_id = $1)
+               ORDER BY m.sent_at DESC
+               LIMIT $3"#,
+            cols = Self::msg_cols()
         );
-        let rows: Vec<Row> = exec_rows(
-            &self.pool,
-            &q,
-            (
-                &sender_b[..],
-                &reader_b[..],
-                &reader_b[..],
-                &sender_b[..],
-                limit,
-            ),
-        )
-        .await?;
+        let rows = exec_rows(&self.pool, &q, &[&sender_b, &reader_b, &(limit as i64)]).await?;
 
         let mut msgs: Vec<Message> = rows
-            .into_iter()
-            .map(|r| Self::row_to_message(&r))
+            .iter()
+            .map(Self::row_to_message)
             .collect::<Result<_>>()?;
         msgs.reverse(); // oldest first
         Ok(msgs)
     }
 
     pub async fn mark_read(&self, reader_id: &str, sender_id: &str) -> Result<()> {
-        let reader_b = ulid_to_bytes(reader_id)?;
-        let sender_b = ulid_to_bytes(sender_id)?;
+        let reader_b = id_to_vec(reader_id)?;
+        let sender_b = id_to_vec(sender_id)?;
         exec_drop(
             &self.pool,
-            "UPDATE messages SET read_at = NOW(3) WHERE recipient_id = ? AND sender_id = ? AND read_at IS NULL",
-            (&reader_b[..], &sender_b[..]),
+            "UPDATE messages SET read_at=NOW() WHERE recipient_id=$1 AND sender_id=$2 AND read_at IS NULL",
+            &[&reader_b, &sender_b],
         )
         .await
     }
 
     pub async fn mark_delivered(&self, msg_id: &str) -> Result<()> {
-        let msg_id_b = ulid_to_bytes(msg_id)?;
+        let msg_b = id_to_vec(msg_id)?;
         exec_drop(
             &self.pool,
-            "UPDATE messages SET delivered_at = NOW(3) WHERE id = ? AND delivered_at IS NULL",
-            (&msg_id_b[..],),
+            "UPDATE messages SET delivered_at=NOW() WHERE id=$1 AND delivered_at IS NULL",
+            &[&msg_b],
         )
         .await
     }

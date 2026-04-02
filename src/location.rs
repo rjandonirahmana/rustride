@@ -23,6 +23,7 @@
 use anyhow::{Context, Result};
 use prost::Message;
 use redis::{aio::ConnectionManager, AsyncCommands};
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{models::order::DriverLocation, proto::order::DriverLocationMeta};
@@ -273,23 +274,52 @@ impl LocationService {
     ) -> Result<Vec<(String, f64)>> {
         Self::validate_coords(lat, lng)?;
 
+        // Hard timeout 4s — GEOSEARCH besar tidak boleh blok search_driver_loop
+        tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            self.find_nearby_drivers_inner(lat, lng, service_type),
+        )
+        .await
+        .map_err(|_| {
+            tracing::error!(
+                service_type,
+                lat,
+                lng,
+                "find_nearby_drivers timed out (>4s)"
+            );
+            anyhow::anyhow!("find_nearby_drivers timeout")
+        })?
+    }
+
+    async fn find_nearby_drivers_inner(
+        &self,
+        lat: f64,
+        lng: f64,
+        service_type: &str,
+    ) -> Result<Vec<(String, f64)>> {
+        // 1 koneksi untuk seluruh flow — tidak buka clone baru di setiap sub-call
         let mut redis = self.redis.clone();
 
-        let mut candidates = self
-            .geosearch_ready(lat, lng, service_type, SEARCH_RADIUS_KM)
-            .await?;
+        let mut candidates =
+            Self::geosearch_ready_conn(&mut redis, lat, lng, service_type, SEARCH_RADIUS_KM)
+                .await?;
 
         if candidates.len() < MIN_DRIVERS {
-            candidates = self
-                .geosearch_ready(lat, lng, service_type, SEARCH_RADIUS_EXPAND_KM)
-                .await?;
+            candidates = Self::geosearch_ready_conn(
+                &mut redis,
+                lat,
+                lng,
+                service_type,
+                SEARCH_RADIUS_EXPAND_KM,
+            )
+            .await?;
         }
 
         if candidates.is_empty() {
             return Ok(vec![]);
         }
 
-        // MGET loc — filter offline. is_some() tanpa decode cukup untuk cek keberadaan.
+        // MGET loc — filter offline
         let loc_keys: Vec<String> = candidates.iter().map(|(id, _)| Self::loc_key(id)).collect();
 
         let loc_data: Vec<Option<Vec<u8>>> = redis::cmd("MGET")
@@ -301,7 +331,6 @@ impl LocationService {
                 vec![None; candidates.len()]
             });
 
-        // Filter: hanya driver yang loc key-nya masih hidup
         let online_candidates: Vec<(&str, f64)> = candidates
             .iter()
             .enumerate()
@@ -360,8 +389,9 @@ impl LocationService {
         Ok(result)
     }
 
-    async fn geosearch_ready(
-        &self,
+    // Terima &mut ConnectionManager agar bisa share 1 koneksi dengan caller
+    async fn geosearch_ready_conn(
+        redis: &mut ConnectionManager,
         lat: f64,
         lng: f64,
         service_type: &str,
@@ -381,12 +411,12 @@ impl LocationService {
             .arg("COUNT")
             .arg(CANDIDATE_FETCH)
             .arg("WITHDIST")
-            .query_async(&mut self.redis.clone())
+            .query_async(redis)
             .await
-            .unwrap_or_else(|e| {
+            .map_err(|e| {
                 tracing::error!(error = ?e, service_type, radius_km, "GEOSEARCH failed");
-                vec![]
-            });
+                anyhow::anyhow!("GEOSEARCH failed: {e}")
+            })?;
 
         Ok(raw
             .into_iter()

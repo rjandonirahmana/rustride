@@ -100,7 +100,7 @@ where
         // ── Connect + notify ──────────────────────────────────────────────────
         let (event_rx, cancel_token) = self.connections.connect(&user_id, &role).await;
 
-        tracing::info!(user_id, role, vehicle_type, "user connected");
+        tracing::info!("user connected {} {} {}", user_id, role, vehicle_type);
 
         self.connections.send(
             &user_id,
@@ -109,6 +109,7 @@ where
                     user_id: user_id.clone(),
                     role: role.clone(),
                     username: claims.name.clone(),
+                    vehicle_type: vehicle_type.clone(),
                 })),
             }),
             Priority::Critical,
@@ -146,7 +147,6 @@ where
             throttle: self.throttle.clone(),
         };
 
-        let user_repo = self.user_repo.clone();
         let mut in_stream = request.into_inner();
 
         // ── Stream loop ───────────────────────────────────────────────────────

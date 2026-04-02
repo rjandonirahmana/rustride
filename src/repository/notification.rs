@@ -1,28 +1,29 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use mysql_async::{from_value, Pool, Row};
+use deadpool_postgres::Pool;
+use tokio_postgres::Row;
 
-use super::db::{col, col_opt_str, exec_drop, exec_rows};
-use crate::utils::ulid::{bin_to_ulid, bin_to_ulid_opt, ulid_to_bytes};
+use super::db::{col_opt_str, exec_drop, exec_first, exec_rows};
+use crate::utils::ulid::{bin_to_ulid, bin_to_ulid_opt, id_to_vec, ulid_to_vec};
 
-// ── Model ─────────────────────────────────────────────────────────────────────
+// ── notifications.id adalah GENERATED ALWAYS AS IDENTITY ─────────────────────
+// Tidak boleh insert id manual — PostgreSQL generate sendiri.
+// Pakai RETURNING id untuk dapat id yang baru dibuat.
 
 #[derive(Debug, Clone)]
 pub struct Notification {
-    pub id: i64,         // BIGINT AUTO_INCREMENT — tetap i64
-    pub user_id: String, // BINARY(16) → ULID string
+    pub id: i64,
+    pub user_id: String,
     pub notif_type: String,
     pub title: String,
     pub body: String,
-    pub ref_order_id: Option<String>, // BINARY(16) nullable → ULID string
-    pub ref_user_id: Option<String>,  // BINARY(16) nullable → ULID string
+    pub ref_order_id: Option<String>,
+    pub ref_user_id: Option<String>,
     pub meta: Option<String>,
     pub is_read: bool,
     pub read_at: Option<String>,
     pub created_at: String,
 }
-
-// ── Trait ─────────────────────────────────────────────────────────────────────
 
 #[async_trait]
 pub trait NotificationRepositoryTrait: Send + Sync {
@@ -36,7 +37,6 @@ pub trait NotificationRepositoryTrait: Send + Sync {
         ref_user_id: Option<&str>,
         meta: Option<&str>,
     ) -> Result<i64>;
-
     async fn list(
         &self,
         user_id: &str,
@@ -44,13 +44,10 @@ pub trait NotificationRepositoryTrait: Send + Sync {
         before_id: Option<i64>,
         unread_only: bool,
     ) -> Result<Vec<Notification>>;
-
     async fn mark_read(&self, notif_id: i64, user_id: &str) -> Result<()>;
     async fn mark_all_read(&self, user_id: &str) -> Result<()>;
     async fn unread_count(&self, user_id: &str) -> Result<i64>;
 }
-
-// ── MySQL implementasi ────────────────────────────────────────────────────────
 
 pub struct NotificationRepository {
     pool: Pool,
@@ -61,31 +58,32 @@ impl NotificationRepository {
         Self { pool }
     }
 
-    fn row_to_notification(row: &Row) -> Result<Notification> {
-        Ok(Notification {
-            id: from_value(col(row, "id")?),
-            user_id: bin_to_ulid(from_value(col(row, "user_id")?))?,
-            notif_type: from_value(col(row, "type")?),
-            title: from_value(col(row, "title")?),
-            body: from_value(col(row, "body")?),
-            ref_order_id: bin_to_ulid_opt(col(row, "ref_order_id")?)?,
-            ref_user_id: bin_to_ulid_opt(col(row, "ref_user_id")?)?,
-            meta: col_opt_str(row, "meta"),
-            is_read: {
-                let v: u8 = from_value(col(row, "is_read")?);
-                v != 0
-            },
-            read_at: col_opt_str(row, "read_at"),
-            created_at: from_value(col(row, "created_at")?),
-        })
+    fn notif_cols() -> &'static str {
+        // "type" di-quote karena reserved word di SQL
+        r#"id, user_id, "type" AS notif_type, title, body,
+           ref_order_id, ref_user_id, meta::TEXT AS meta,
+           is_read,
+           to_char(read_at    AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS read_at,
+           to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at"#
     }
 
-    // SELECT cols yang sama dipakai di semua list query
-    fn notif_cols() -> &'static str {
-        r"id, user_id, type, title, body,
-          ref_order_id, ref_user_id, meta,
-          is_read, read_at,
-          DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%sZ') AS created_at"
+    fn row_to_notification(row: &Row) -> Result<Notification> {
+        let uid_bytes: Vec<u8> = row.try_get("user_id")?;
+        let ref_order_bytes: Option<Vec<u8>> = row.try_get("ref_order_id")?;
+        let ref_user_bytes: Option<Vec<u8>> = row.try_get("ref_user_id")?;
+        Ok(Notification {
+            id: row.try_get("id")?,
+            user_id: bin_to_ulid(uid_bytes)?,
+            notif_type: row.try_get("notif_type")?,
+            title: row.try_get("title")?,
+            body: row.try_get("body")?,
+            ref_order_id: bin_to_ulid_opt(ref_order_bytes)?,
+            ref_user_id: bin_to_ulid_opt(ref_user_bytes)?,
+            meta: col_opt_str(row, "meta")?,
+            is_read: row.try_get("is_read")?,
+            read_at: col_opt_str(row, "read_at")?,
+            created_at: row.try_get("created_at")?,
+        })
     }
 }
 
@@ -101,43 +99,36 @@ impl NotificationRepositoryTrait for NotificationRepository {
         ref_user_id: Option<&str>,
         meta: Option<&str>,
     ) -> Result<i64> {
-        let user_id_b = ulid_to_bytes(user_id)?;
+        let user_b = id_to_vec(user_id)?;
 
-        // ref_order_id & ref_user_id nullable BINARY(16) — konversi hanya kalau Some
-        let ref_order_b: Option<[u8; 16]> = ref_order_id.map(ulid_to_bytes).transpose()?;
-        let ref_user_b: Option<[u8; 16]> = ref_user_id.map(ulid_to_bytes).transpose()?;
+        // Optional BYTEA — ulid_to_vec hanya kalau Some
+        let ref_order_b: Option<Vec<u8>> = ref_order_id.map(id_to_vec).transpose()?;
+        let ref_user_b: Option<Vec<u8>> = ref_user_id.map(id_to_vec).transpose()?;
 
-        exec_drop(
+        // id TIDAK diinsert — GENERATED ALWAYS AS IDENTITY
+        // meta::jsonb — cast dari text
+        let row = exec_first(
             &self.pool,
-            r"INSERT INTO notifications
-                (user_id, type, title, body, ref_order_id, ref_user_id, meta)
-              VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                &user_id_b[..],
-                notif_type,
-                title,
-                body,
-                ref_order_b.as_ref().map(|b| b.as_slice()),
-                ref_user_b.as_ref().map(|b| b.as_slice()),
-                meta,
-            ),
+            r#"INSERT INTO notifications
+               (user_id, "type", title, body, ref_order_id, ref_user_id, meta)
+               VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+               RETURNING id"#,
+            &[
+                &user_b, // &Vec<u8> — BYTEA
+                &notif_type,
+                &title,
+                &body,
+                &ref_order_b, // Option<Vec<u8>> — nullable BYTEA
+                &ref_user_b,  // Option<Vec<u8>> — nullable BYTEA
+                &meta,        // Option<&str> — nullable TEXT → jsonb
+            ],
         )
         .await?;
 
-        // Ambil AUTO_INCREMENT id yang baru saja diinsert
-        let rows: Vec<Row> = exec_rows(
-            &self.pool,
-            "SELECT id FROM notifications WHERE user_id = ? ORDER BY id DESC LIMIT 1",
-            (&user_id_b[..],),
-        )
-        .await?;
-
-        let notif_id: i64 = rows
-            .first()
-            .map(|r| from_value(col(r, "id").unwrap()))
-            .unwrap_or(0);
-
-        Ok(notif_id)
+        Ok(row
+            .as_ref()
+            .and_then(|r| r.try_get("id").ok())
+            .unwrap_or(0i64))
     }
 
     async fn list(
@@ -147,66 +138,56 @@ impl NotificationRepositoryTrait for NotificationRepository {
         before_id: Option<i64>,
         unread_only: bool,
     ) -> Result<Vec<Notification>> {
-        let user_id_b = ulid_to_bytes(user_id)?;
+        let user_b = id_to_vec(user_id)?;
         let cols = Self::notif_cols();
+        let limit_i64 = limit as i64;
 
-        let rows: Vec<Row> = match (unread_only, before_id) {
-            (true, Some(bid)) => exec_rows(
-                &self.pool,
-                &format!("SELECT {} FROM notifications WHERE user_id = ? AND is_read = 0 AND id < ? ORDER BY id DESC LIMIT ?", cols),
-                (&user_id_b[..], bid, limit),
-            ).await?,
-            (true, None) => exec_rows(
-                &self.pool,
-                &format!("SELECT {} FROM notifications WHERE user_id = ? AND is_read = 0 ORDER BY id DESC LIMIT ?", cols),
-                (&user_id_b[..], limit),
-            ).await?,
-            (false, Some(bid)) => exec_rows(
-                &self.pool,
-                &format!("SELECT {} FROM notifications WHERE user_id = ? AND id < ? ORDER BY id DESC LIMIT ?", cols),
-                (&user_id_b[..], bid, limit),
-            ).await?,
-            (false, None) => exec_rows(
-                &self.pool,
-                &format!("SELECT {} FROM notifications WHERE user_id = ? ORDER BY id DESC LIMIT ?", cols),
-                (&user_id_b[..], limit),
-            ).await?,
+        let rows = match (unread_only, before_id) {
+            (true,  Some(bid)) => exec_rows(&self.pool,
+                &format!("SELECT {cols} FROM notifications WHERE user_id=$1 AND is_read=false AND id<$2 ORDER BY id DESC LIMIT $3"),
+                &[&user_b, &bid, &limit_i64]).await?,
+            (true,  None) => exec_rows(&self.pool,
+                &format!("SELECT {cols} FROM notifications WHERE user_id=$1 AND is_read=false ORDER BY id DESC LIMIT $2"),
+                &[&user_b, &limit_i64]).await?,
+            (false, Some(bid)) => exec_rows(&self.pool,
+                &format!("SELECT {cols} FROM notifications WHERE user_id=$1 AND id<$2 ORDER BY id DESC LIMIT $3"),
+                &[&user_b, &bid, &limit_i64]).await?,
+            (false, None) => exec_rows(&self.pool,
+                &format!("SELECT {cols} FROM notifications WHERE user_id=$1 ORDER BY id DESC LIMIT $2"),
+                &[&user_b, &limit_i64]).await?,
         };
 
         rows.iter().map(Self::row_to_notification).collect()
     }
 
     async fn mark_read(&self, notif_id: i64, user_id: &str) -> Result<()> {
-        let user_id_b = ulid_to_bytes(user_id)?;
+        let user_b = id_to_vec(user_id)?;
         exec_drop(
             &self.pool,
-            "UPDATE notifications SET is_read = 1, read_at = NOW(3) WHERE id = ? AND user_id = ?",
-            (notif_id, &user_id_b[..]),
+            "UPDATE notifications SET is_read=true, read_at=NOW() WHERE id=$1 AND user_id=$2",
+            &[&notif_id, &user_b],
         )
         .await
     }
 
     async fn mark_all_read(&self, user_id: &str) -> Result<()> {
-        let user_id_b = ulid_to_bytes(user_id)?;
-        exec_drop(
-            &self.pool,
-            "UPDATE notifications SET is_read = 1, read_at = NOW(3) WHERE user_id = ? AND is_read = 0",
-            (&user_id_b[..],),
-        )
-        .await
+        let user_b = id_to_vec(user_id)?;
+        exec_drop(&self.pool,
+            "UPDATE notifications SET is_read=true, read_at=NOW() WHERE user_id=$1 AND is_read=false",
+            &[&user_b]).await
     }
 
     async fn unread_count(&self, user_id: &str) -> Result<i64> {
-        let user_id_b = ulid_to_bytes(user_id)?;
-        let rows: Vec<Row> = exec_rows(
+        let user_b = id_to_vec(user_id)?;
+        let row = exec_first(
             &self.pool,
-            "SELECT COUNT(*) AS cnt FROM notifications WHERE user_id = ? AND is_read = 0",
-            (&user_id_b[..],),
+            "SELECT COUNT(*)::BIGINT AS cnt FROM notifications WHERE user_id=$1 AND is_read=false",
+            &[&user_b],
         )
         .await?;
-        Ok(rows
-            .first()
-            .map(|r| from_value(col(r, "cnt").unwrap()))
-            .unwrap_or(0))
+        Ok(row
+            .as_ref()
+            .and_then(|r| r.try_get("cnt").ok())
+            .unwrap_or(0i64))
     }
 }

@@ -162,7 +162,7 @@ impl<R: UserRepository> AuthService<R> {
     // ── WA OTP ────────────────────────────────────────────────────────────────
 
     async fn send_wa_otp(&self, phone: &str, otp: &str) -> Result<()> {
-        let normalized = normalize_phone(phone);
+        let normalized = normalize_phone(phone)?;
 
         let body = json!({
             "chatId": normalized,
@@ -196,18 +196,20 @@ impl<R: UserRepository> AuthService<R> {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn normalize_phone(phone: &str) -> String {
+fn normalize_phone(phone: &str) -> Result<String> {
     let digits: String = phone.chars().filter(|c| c.is_ascii_digit()).collect();
 
-    let normalized = if digits.starts_with("08") {
+    let normalized = if digits.starts_with("08") || digits.starts_with("+62") {
         format!("62{}", &digits[1..])
     } else if digits.starts_with("62") {
         digits
     } else {
-        digits
+        return Err(anyhow::anyhow!(
+            "Nomor HP harus diawali dengan '08' atau '+62'"
+        ));
     };
 
-    format!("{}@c.us", normalized)
+    Ok(format!("{}@c.us", normalized))
 }
 
 fn constant_time_eq(a: &str, b: &str) -> bool {

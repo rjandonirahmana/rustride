@@ -21,6 +21,7 @@ use crate::{
         order::{NewOrder, OrderRepository},
         user::UserRepository,
     },
+    utils::ulid::id_to_vec,
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -58,7 +59,7 @@ pub fn order_to_proto(o: &Order) -> crate::proto::order::Order {
 fn status_event(
     order_id: &str,
     status: &str,
-    service_tye: &str,
+    service_type: &str,
     fare_estimate: &i32,
     rider_id: &str,
     rider_name: &str,
@@ -68,7 +69,7 @@ fn status_event(
             order_id: order_id.to_string(),
             status: status.to_string(),
             driver: None,
-            service_type: service_tye.to_string(),
+            service_type: service_type.to_string(),
             fare_estimate: *fare_estimate,
             rider_id: rider_id.to_string(),
             rider_name: rider_name.to_string(),
@@ -166,10 +167,20 @@ where
             Priority::Normal,
         );
 
-        // Spawn background driver matching
+        // Spawn background driver matching:
+        // 1. notify_nearby_drivers — push NewOrder langsung ke semua driver terdekat (immediate)
+        // 2. search_driver_loop — fallback loop jika tidak ada yang accept dalam timeout
         let svc = self.clone();
         let o = order.clone();
-        tokio::spawn(async move { svc.search_driver_loop(o).await });
+        let rider_id_clone = rider_id.to_string();
+        tokio::spawn(async move {
+            // Push order ke semua driver terdekat yang available — ini yang membuat
+            // data order muncul di driver secara realtime tanpa harus pull/browse
+            if let Err(e) = svc.notify_nearby_drivers(&o).await {
+                tracing::warn!(order_id = %o.id, error = %e, "notify_nearby_drivers gagal, lanjut ke search_driver_loop");
+            }
+            svc.search_driver_loop(o, &rider_id_clone).await;
+        });
 
         Ok(order)
     }
@@ -183,6 +194,8 @@ where
             None => return Ok(None),
         };
 
+        tracing::info!(user_id, order_id = %order.id, "User disconnect, cek cancel order aktif");
+
         if order.status != "searching" {
             return Ok(None);
         }
@@ -190,47 +203,6 @@ where
         let reason = "User terputus dari koneksi";
 
         self.order_repo.cancel(&order_id, Some(reason)).await?;
-
-        // Bersihkan Redis kalau driver yang disconnect
-        if order.driver_id.as_deref() == Some(user_id) {
-            let _ = self.location.clear_driver_order(user_id).await;
-            // Notify rider
-            self.connections.send(
-                &order.rider_id,
-                Arc::new(ServerEvent {
-                    payload: Some(Sp::OrderStatus(OrderStatusEvent {
-                        order_id: order_id.clone(),
-                        status: "cancelled".to_string(),
-                        driver: None,
-                        service_type: order.service_type.clone(),
-                        fare_estimate: order.fare_estimate,
-                        rider_id: order.rider_id.clone(),
-                        rider_name: order.rider_name,
-                    })),
-                }),
-                Priority::Normal,
-            );
-        } else {
-            // Rider yang disconnect — notify driver kalau ada
-            if let Some(ref driver_id) = order.driver_id {
-                let _ = self.location.clear_driver_order(driver_id).await;
-                self.connections.send(
-                    driver_id,
-                    Arc::new(ServerEvent {
-                        payload: Some(Sp::OrderStatus(OrderStatusEvent {
-                            order_id: order_id.clone(),
-                            status: "cancelled".to_string(),
-                            driver: None,
-                            service_type: order.service_type.clone(),
-                            fare_estimate: order.fare_estimate,
-                            rider_id: order.rider_id,
-                            rider_name: order.rider_name,
-                        })),
-                    }),
-                    Priority::Normal,
-                );
-            }
-        }
 
         Ok(Some(order_id))
     }
@@ -243,10 +215,10 @@ where
             .await
             .unwrap_or_default();
 
-        // Filter hanya yang online + tidak sedang order
-        let mut eligible_ids = vec![];
-        for (driver_id, _) in &nearby {
-            if !self.connections.is_connected(driver_id).await {
+        // Filter hanya yang online + tidak sedang order, sambil simpan jarak
+        let mut eligible: Vec<(String, f64)> = vec![];
+        for (driver_id, dist_m) in &nearby {
+            if !self.connections.is_connected(driver_id).await? {
                 continue;
             }
             if self
@@ -258,44 +230,47 @@ where
             {
                 continue;
             }
-            eligible_ids.push(driver_id.clone().to_string());
+            eligible.push((driver_id.clone().to_string(), *dist_m));
         }
 
-        if eligible_ids.is_empty() {
+        if eligible.is_empty() {
             return Ok(());
         }
 
-        // Kirim notif "ada order baru di sekitar kamu"
-        let event = ServerEvent {
-            payload: Some(Sp::NewOrder(NewOrderOffer {
-                order: Some(cpOrder {
-                    order_id: order.id.clone(),
-                    rider_id: order.rider_id.clone(),
-                    driver_id: "".to_string(),
-                    status: order.status.clone(),
-                    pickup_address: order.pickup_address.clone(),
-                    pickup_lat: order.pickup_lat,
-                    pickup_lng: order.pickup_lng,
-                    dest_address: order.dest_address.clone(),
-                    dest_lat: order.dest_lat,
-                    dest_lng: order.dest_lng,
-                    fare_estimate: order.fare_estimate,
-                    service_type: order.service_type.clone(),
-                    created_at: order.created_at.clone(),
-                    driver: None,
-                }),
-                distance_to_pickup_m: order.distance_km.unwrap_or_default(),
-                eta_to_pickup_min: 1000.0,
-                timeout_secs: 100,
-            })),
-        };
-
-        self.connections
-            .send_to_drivers(eligible_ids, Arc::new(event), Priority::Normal);
+        // Kirim notif individual per driver dengan jarak yang akurat
+        for (driver_id, dist_m) in eligible {
+            let eta_min = (dist_m / 1000.0 / 30.0 * 60.0) as f32;
+            let event = ServerEvent {
+                payload: Some(Sp::NewOrder(NewOrderOffer {
+                    order: Some(cpOrder {
+                        order_id: order.id.clone(),
+                        rider_id: order.rider_id.clone(),
+                        driver_id: "".to_string(),
+                        status: order.status.clone(),
+                        pickup_address: order.pickup_address.clone(),
+                        pickup_lat: order.pickup_lat,
+                        pickup_lng: order.pickup_lng,
+                        dest_address: order.dest_address.clone(),
+                        dest_lat: order.dest_lat,
+                        dest_lng: order.dest_lng,
+                        fare_estimate: order.fare_estimate,
+                        service_type: order.service_type.clone(),
+                        created_at: order.created_at.clone(),
+                        driver: None,
+                    }),
+                    distance_to_pickup_m: dist_m as f32,
+                    eta_to_pickup_min: eta_min,
+                    timeout_secs: 30,
+                })),
+            };
+            self.connections
+                .send(&driver_id, Arc::new(event), Priority::Normal);
+        }
         Ok(())
     }
 
-    async fn search_driver_loop(&self, order: Order) {
+    async fn search_driver_loop(&self, order: Order, rider_id: &str) {
+        tracing::info!(order_id = %order.id, "Mulai search_driver_loop untuk order");
         const OFFER_TIMEOUT: u64 = 15;
         const MIN_RATING: f32 = 3.0;
         const RETRY_DELAY_SECS: u64 = 5;
@@ -306,6 +281,19 @@ where
         loop {
             round += 1;
             tracing::info!(order_id = %order.id, round, "Search driver round");
+
+            match self.connections.is_connected(rider_id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::info!(order_id = %order.id, "Rider sudah disconnect, stop loop");
+                    return;
+                }
+                Err(e) => {
+                    tracing::error!("is_connected error: {}", e);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(RETRY_DELAY_SECS)).await;
+                    return;
+                }
+            }
 
             // ── PINDAH KE ATAS — cek status SEBELUM apapun ───────────────────
             match self.order_repo.find_by_id(&order.id).await {
@@ -338,8 +326,28 @@ where
                 }
             };
 
-            if round % 3 == 0 && !offered.is_empty() {
-                tracing::info!(order_id = %order.id, "Reset offered list setelah 3 round");
+            tracing::info!(
+                order_id = %order.id,
+                round,
+                count = nearby.len(),
+                service_type = %order.service_type,
+                pickup_lat = order.pickup_lat,
+                pickup_lng = order.pickup_lng,
+                "find_nearby_drivers result"
+            );
+
+            // Reset offered list setiap 3 round ATAU kalau semua driver nearby
+            // sudah pernah di-offer (driver reconnect setelah offline perlu
+            // mendapat offer ulang tanpa menunggu 3 round penuh)
+            let all_offered =
+                !nearby.is_empty() && nearby.iter().all(|(id, _)| offered.contains(id));
+            if (round % 3 == 0 || all_offered) && !offered.is_empty() {
+                tracing::info!(
+                    order_id = %order.id,
+                    round,
+                    all_offered,
+                    "Reset offered list"
+                );
                 offered.clear();
             }
 
@@ -353,11 +361,24 @@ where
 
             for (driver_id, dist_m) in nearby {
                 if offered.contains(&driver_id) {
+                    tracing::debug!(driver_id = %driver_id, "skip: sudah pernah di-offer");
                     continue;
                 }
-                if !self.connections.is_connected(&driver_id).await {
-                    continue;
+
+                match self.connections.is_connected(rider_id).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::info!(order_id = %order.id, "Rider sudah disconnect, stop loop");
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::error!("is_connected error: {}", e);
+                        tokio::time::sleep(tokio::time::Duration::from_secs(RETRY_DELAY_SECS))
+                            .await;
+                        return;
+                    }
                 }
+
                 if self
                     .location
                     .get_driver_order(&driver_id)
@@ -365,15 +386,24 @@ where
                     .unwrap_or(None)
                     .is_some()
                 {
+                    tracing::info!(driver_id = %driver_id, "skip: driver sudah punya order aktif di Redis");
                     continue;
                 }
 
                 let (_user, profile) = match self.user_repo.find_driver_by_id(&driver_id).await {
                     Ok(Some(v)) => v,
-                    _ => continue,
+                    Ok(None) => {
+                        tracing::warn!(driver_id = %driver_id, "skip: driver tidak ditemukan di DB");
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::error!(driver_id = %driver_id, error = %e, "skip: gagal fetch driver profile");
+                        continue;
+                    }
                 };
 
                 if profile.rating < MIN_RATING {
+                    tracing::info!(driver_id = %driver_id, rating = profile.rating, min = MIN_RATING, "skip: rating terlalu rendah");
                     continue;
                 }
                 if profile.vehicle_type != order.service_type {
@@ -452,8 +482,56 @@ where
                 Priority::Normal,
             );
 
-            // Tunggu response driver
-            tokio::time::sleep(tokio::time::Duration::from_secs(OFFER_TIMEOUT + 2)).await;
+            // Poll setiap 1 detik selama OFFER_TIMEOUT:
+            // - Kalau order sudah tidak searching (driver accept) → stop
+            // - Kalau driver offline → langsung next round, cari driver lain
+            // - Kalau timeout habis → next round (driver tidak respond)
+            let mut elapsed = 0u64;
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                elapsed += 1;
+
+                // Cek order masih searching
+                match self.order_repo.find_by_id(&order.id).await {
+                    Ok(Some(o)) if o.status != "searching" => {
+                        tracing::info!(order_id = %order.id, status = %o.status, "Order accepted, stop loop");
+                        return;
+                    }
+                    Ok(None) => return,
+                    Err(e) => {
+                        tracing::error!("find_by_id poll error: {}", e);
+                        break;
+                    }
+                    _ => {}
+                }
+
+                // Kalau driver offline → langsung cari driver lain, jangan tunggu
+                match self.connections.is_connected(&best.driver_id).await {
+                    Ok(false) => {
+                        tracing::info!(
+                            order_id = %order.id,
+                            driver_id = %best.driver_id,
+                            elapsed,
+                            "Driver offline saat menunggu respons, cari driver lain"
+                        );
+                        // Reset offered supaya kalau tidak ada driver lain,
+                        // driver ini bisa di-offer ulang saat sudah online lagi
+                        offered.remove(&best.driver_id);
+                        break;
+                    }
+                    Ok(true) => {}
+                    Err(_) => break,
+                }
+
+                if elapsed >= OFFER_TIMEOUT {
+                    tracing::info!(
+                        order_id = %order.id,
+                        driver_id = %best.driver_id,
+                        "Driver tidak respond dalam timeout, cari driver lain"
+                    );
+                    break;
+                }
+            }
         }
     }
 
@@ -647,35 +725,37 @@ where
 
         let is_owner = match role {
             "rider" => order.rider_id == user_id,
-            "driver" => order.driver_id.as_deref() == Some(user_id),
+            "driver" => order.driver_id.as_ref() == Some(&user_id.to_string()),
             _ => false,
         };
+
         if !is_owner {
-            bail!("Bukan order kamu");
+            bail!(
+        "Bukan order kamu. role: {}, user_id: {}, order.rider_id: {}, order.driver_id: {:?}",
+        role, user_id, order.rider_id, order.driver_id
+    );
         }
         if matches!(order.status.as_str(), "completed" | "cancelled") {
             bail!("Order sudah {}", order.status);
         }
 
+        if role == "rider" && order.status != "searching" {
+            bail!(
+                "Order tidak bisa dicancel karena sudah {} oleh driver",
+                order.status
+            );
+        }
+
+        // Driver: hanya bisa cancel jika status 'driver_accepted'
+        if role == "driver" && order.status != "driver_accepted" {
+            bail!(
+                "Order tidak bisa dicancel karena status masih {}",
+                order.status
+            );
+        }
+
         self.order_repo.cancel(order_id, reason.as_deref()).await?;
 
-        if let Some(ref driver_id) = order.driver_id {
-            let _ = self.location.clear_driver_order(driver_id).await;
-            if role == "rider" {
-                self.connections.send(
-                    driver_id,
-                    status_event(
-                        order_id,
-                        "cancelled",
-                        &order.service_type,
-                        &order.fare_estimate,
-                        &order.rider_id,
-                        &order.rider_name,
-                    ),
-                    Priority::Normal,
-                );
-            }
-        }
         if role == "driver" {
             self.connections.send(
                 &order.rider_id,

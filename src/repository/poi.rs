@@ -1,6 +1,8 @@
-// src/handler/poi.rs
+// src/repository/poi.rs
 
+use deadpool_postgres::Pool;
 use std::sync::Arc;
+use tokio_postgres::Row;
 use tonic::{Request, Response, Status};
 
 use crate::proto::poi::{
@@ -9,7 +11,7 @@ use crate::proto::poi::{
 };
 
 pub struct PoiServiceImpl {
-    pub pool: Arc<mysql_async::Pool>,
+    pub pool: Arc<Pool>,
 }
 
 #[tonic::async_trait]
@@ -27,19 +29,18 @@ impl PoiService for PoiServiceImpl {
         let radius_km = if r.radius_km <= 0.0 { 2.0 } else { r.radius_km };
         let limit = if r.limit <= 0 { 20 } else { r.limit.min(100) };
 
-        let mut conn = self
+        // deadpool: pool.get() → Object (auto-return saat drop)
+        let conn = self
             .pool
-            .get_conn()
+            .get()
             .await
             .map_err(|e| Status::internal(format!("DB connection error: {e}")))?;
 
-        // Build query — filter subcategory opsional
         let pois = if r.subcategory.is_empty() {
-            search_nearby_query(&mut conn, r.lat, r.lng, radius_km, &r.category, None, limit)
-                .await?
+            search_nearby_query(&conn, r.lat, r.lng, radius_km, &r.category, None, limit).await?
         } else {
             search_nearby_query(
-                &mut conn,
+                &conn,
                 r.lat,
                 r.lng,
                 radius_km,
@@ -63,18 +64,17 @@ impl PoiService for PoiServiceImpl {
             return Err(Status::invalid_argument("id wajib diisi"));
         }
 
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| Status::internal(format!("DB connection error: {e}")))?;
-
         let id: i64 =
             r.id.parse()
                 .map_err(|_| Status::invalid_argument("id tidak valid"))?;
 
-        let poi = get_poi_by_id(&mut conn, id).await?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Status::internal(format!("DB connection error: {e}")))?;
 
+        let poi = get_poi_by_id(&conn, id).await?;
         Ok(Response::new(PoiDetailResponse { poi: Some(poi) }))
     }
 }
@@ -82,7 +82,7 @@ impl PoiService for PoiServiceImpl {
 // ── Query helpers ─────────────────────────────────────────────────────────────
 
 async fn search_nearby_query(
-    conn: &mut mysql_async::Conn,
+    conn: &deadpool_postgres::Object,
     lat: f64,
     lng: f64,
     radius_km: f32,
@@ -90,119 +90,131 @@ async fn search_nearby_query(
     subcategory: Option<&str>,
     limit: i32,
 ) -> Result<Vec<PoiItem>, Status> {
-    use mysql_async::prelude::*;
+    let radius_m = (radius_km * 1000.0) as f64;
+    let limit_i64 = limit as i64;
 
-    // Haversine formula — hitung jarak dalam meter
-    let base_query = r#"
-        SELECT
-            id, name, COALESCE(name_en, '') as name_en,
-            lat, lng,
-            COALESCE(category, '') as category,
-            COALESCE(subcategory, '') as subcategory,
-            COALESCE(address, '') as address,
-            COALESCE(city, '') as city,
-            COALESCE(phone, '') as phone,
-            COALESCE(website, '') as website,
-            COALESCE(opening_hours, '') as opening_hours,
-            (6371000 * acos(
-                GREATEST(-1.0, LEAST(1.0,
-                    cos(radians(:lat)) * cos(radians(lat)) *
-                    cos(radians(lng) - radians(:lng)) +
-                    sin(radians(:lat)) * sin(radians(lat))
-                ))
-            )) AS distance_m
-        FROM osm_places
-        WHERE category = :category
-        {{subcategory_filter}}
-        HAVING distance_m < :radius_m
-        ORDER BY distance_m
-        LIMIT :limit
-    "#;
+    // tokio-postgres: tidak ada named params (:lat) — pakai $1..$N
+    // tokio-postgres: tidak ada HAVING pada ekspresi non-aggregate di level yang sama
+    // — pindahkan filter jarak ke WHERE dengan subquery atau ulangi ekspresi
+    // Di sini kita ulangi ekspresi haversine di WHERE supaya tetap satu query sederhana.
 
-    let rows: Vec<PoiItem> = if let Some(sub) = subcategory {
-        let query = base_query.replace("{{subcategory_filter}}", "AND subcategory = :subcategory");
-        conn.exec_map(
-            query,
-            mysql_async::params! {
-                "lat" => lat,
-                "lng" => lng,
-                "category" => category,
-                "subcategory" => sub,
-                "radius_m" => (radius_km * 1000.0) as f64,
-                "limit" => limit,
-            },
-            row_to_poi,
+    let rows: Vec<Row> = if let Some(sub) = subcategory {
+        conn.query(
+            r#"SELECT
+                   id, name, COALESCE(name_en, '') AS name_en,
+                   lat, lng,
+                   COALESCE(category, '')      AS category,
+                   COALESCE(subcategory, '')   AS subcategory,
+                   COALESCE(address, '')       AS address,
+                   COALESCE(city, '')          AS city,
+                   COALESCE(phone, '')         AS phone,
+                   COALESCE(website, '')       AS website,
+                   COALESCE(opening_hours, '') AS opening_hours,
+                   (6371000 * acos(
+                       GREATEST(-1.0, LEAST(1.0,
+                           cos(radians($1)) * cos(radians(lat)) *
+                           cos(radians(lng) - radians($2)) +
+                           sin(radians($1)) * sin(radians(lat))
+                       ))
+                   )) AS distance_m
+               FROM osm_places
+               WHERE category    = $3
+                 AND subcategory = $4
+                 AND (6371000 * acos(
+                         GREATEST(-1.0, LEAST(1.0,
+                             cos(radians($1)) * cos(radians(lat)) *
+                             cos(radians(lng) - radians($2)) +
+                             sin(radians($1)) * sin(radians(lat))
+                         ))
+                     )) < $5
+               ORDER BY distance_m
+               LIMIT $6"#,
+            &[&lat, &lng, &category, &sub, &radius_m, &limit_i64],
         )
         .await
         .map_err(|e| Status::internal(format!("Query error: {e}")))?
     } else {
-        let query = base_query.replace("{{subcategory_filter}}", "");
-        conn.exec_map(
-            query,
-            mysql_async::params! {
-                "lat" => lat,
-                "lng" => lng,
-                "category" => category,
-                "radius_m" => (radius_km * 1000.0) as f64,
-                "limit" => limit,
-            },
-            row_to_poi,
+        conn.query(
+            r#"SELECT
+                   id, name, COALESCE(name_en, '') AS name_en,
+                   lat, lng,
+                   COALESCE(category, '')      AS category,
+                   COALESCE(subcategory, '')   AS subcategory,
+                   COALESCE(address, '')       AS address,
+                   COALESCE(city, '')          AS city,
+                   COALESCE(phone, '')         AS phone,
+                   COALESCE(website, '')       AS website,
+                   COALESCE(opening_hours, '') AS opening_hours,
+                   (6371000 * acos(
+                       GREATEST(-1.0, LEAST(1.0,
+                           cos(radians($1)) * cos(radians(lat)) *
+                           cos(radians(lng) - radians($2)) +
+                           sin(radians($1)) * sin(radians(lat))
+                       ))
+                   )) AS distance_m
+               FROM osm_places
+               WHERE category = $3
+                 AND (6371000 * acos(
+                         GREATEST(-1.0, LEAST(1.0,
+                             cos(radians($1)) * cos(radians(lat)) *
+                             cos(radians(lng) - radians($2)) +
+                             sin(radians($1)) * sin(radians(lat))
+                         ))
+                     )) < $4
+               ORDER BY distance_m
+               LIMIT $5"#,
+            &[&lat, &lng, &category, &radius_m, &limit_i64],
         )
         .await
         .map_err(|e| Status::internal(format!("Query error: {e}")))?
     };
 
-    Ok(rows)
+    Ok(rows.iter().map(row_to_poi).collect())
 }
 
-async fn get_poi_by_id(conn: &mut mysql_async::Conn, id: i64) -> Result<PoiItem, Status> {
-    use mysql_async::prelude::*;
-
-    let row: Option<PoiItem> = conn
-        .exec_first(
-            r#"
-            SELECT
-                id, name, COALESCE(name_en, '') as name_en,
-                lat, lng,
-                COALESCE(category, '') as category,
-                COALESCE(subcategory, '') as subcategory,
-                COALESCE(address, '') as address,
-                COALESCE(city, '') as city,
-                COALESCE(phone, '') as phone,
-                COALESCE(website, '') as website,
-                COALESCE(opening_hours, '') as opening_hours,
-                0.0 AS distance_m
-            FROM osm_places
-            WHERE id = :id
-            "#,
-            mysql_async::params! { "id" => id },
-        )
-        .await
-        .map_err(|e| Status::internal(format!("Query error: {e}")))?
-        .map(row_to_poi);
-
-    row.ok_or_else(|| Status::not_found(format!("POI {id} tidak ditemukan")))
+async fn get_poi_by_id(conn: &deadpool_postgres::Object, id: i64) -> Result<PoiItem, Status> {
+    conn.query_opt(
+        r#"SELECT
+               id, name, COALESCE(name_en, '') AS name_en,
+               lat, lng,
+               COALESCE(category, '')      AS category,
+               COALESCE(subcategory, '')   AS subcategory,
+               COALESCE(address, '')       AS address,
+               COALESCE(city, '')          AS city,
+               COALESCE(phone, '')         AS phone,
+               COALESCE(website, '')       AS website,
+               COALESCE(opening_hours, '') AS opening_hours,
+               0.0::FLOAT8                AS distance_m
+           FROM osm_places
+           WHERE id = $1"#,
+        &[&id],
+    )
+    .await
+    .map_err(|e| Status::internal(format!("Query error: {e}")))?
+    .map(|r| row_to_poi(&r))
+    .ok_or_else(|| Status::not_found(format!("POI {id} tidak ditemukan")))
 }
 
 // ── Row mapper ────────────────────────────────────────────────────────────────
+//
+// Sebelumnya: row.get(0), row.get(1) — index positional mysql_async
+// Sesudah:    row.try_get("col_name") — by name tokio-postgres (lebih aman)
 
-fn row_to_poi(row: mysql_async::Row) -> PoiItem {
-    use mysql_async::prelude::FromRow;
-
-    let id: i64 = row.get(0).unwrap_or(0);
+fn row_to_poi(row: &Row) -> PoiItem {
+    let id: i64 = row.try_get("id").unwrap_or(0);
     PoiItem {
         id: id.to_string(),
-        name: row.get(1).unwrap_or_default(),
-        name_en: row.get(2).unwrap_or_default(),
-        lat: row.get(3).unwrap_or(0.0),
-        lng: row.get(4).unwrap_or(0.0),
-        category: row.get(5).unwrap_or_default(),
-        subcategory: row.get(6).unwrap_or_default(),
-        address: row.get(7).unwrap_or_default(),
-        city: row.get(8).unwrap_or_default(),
-        phone: row.get(9).unwrap_or_default(),
-        website: row.get(10).unwrap_or_default(),
-        opening_hours: row.get(11).unwrap_or_default(),
-        distance_m: row.get::<f64, _>(12).unwrap_or(0.0) as f32,
+        name: row.try_get("name").unwrap_or_default(),
+        name_en: row.try_get("name_en").unwrap_or_default(),
+        lat: row.try_get("lat").unwrap_or(0.0),
+        lng: row.try_get("lng").unwrap_or(0.0),
+        category: row.try_get("category").unwrap_or_default(),
+        subcategory: row.try_get("subcategory").unwrap_or_default(),
+        address: row.try_get("address").unwrap_or_default(),
+        city: row.try_get("city").unwrap_or_default(),
+        phone: row.try_get("phone").unwrap_or_default(),
+        website: row.try_get("website").unwrap_or_default(),
+        opening_hours: row.try_get("opening_hours").unwrap_or_default(),
+        distance_m: row.try_get::<_, f64>("distance_m").unwrap_or(0.0) as f32,
     }
 }
