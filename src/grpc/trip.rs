@@ -212,7 +212,8 @@ where
             }
         });
 
-        let out = tokio_stream::wrappers::ReceiverStream::new(event_rx);
+        let out = tokio_stream::wrappers::ReceiverStream::new(event_rx)
+            .map(|r| r.map(|arc| (arc).clone()));
         Ok(Response::new(Box::pin(out)))
     }
 }

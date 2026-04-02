@@ -144,9 +144,9 @@ async fn main() -> anyhow::Result<()> {
         user_repo.clone(),
         order_repo.clone(),
         location,
-        redis_conn.clone(),
         redis_client.clone(),
-    );
+    )
+    .await?;
 
     let service_chat = service::chat::ChatService {
         msg_repo: message_repo.clone(),

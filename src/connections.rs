@@ -1,13 +1,42 @@
-// Tambahkan ke Cargo.toml:
-//
-// flume   = "0.11"
-// ahash   = "0.8"
-// futures = "0.3"
+//! connection_manager.rs
+//!
+//! Optimisasi vs versi sebelumnya:
+//!
+//! 1. **Single DashMap** — `channels: DashMap<Arc<str>, Session>` menggantikan
+//!    3 struktur terpisah (channels + drivers + riders DashSet).
+//!    Setiap operasi kini hanya satu lock acquisition, bukan tiga.
+//!
+//! 2. **Inline role tag** — `Session.role: u8` (0 = driver, 1 = rider) disimpan
+//!    langsung di value. Tidak ada DashSet tambahan, tidak ada pointer chasing.
+//!
+//! 3. **`bytes::Bytes` sebagai wire buffer** — menggantikan `Arc<[u8]>`.
+//!    `Bytes` adalah reference-counted slice yang zero-copy; clone hanya
+//!    menaikkan refcount tanpa menyalin data. Cocok untuk fanout banyak penerima.
+//!
+//! 4. **`MultiplexedConnection`** — redis 1.x tidak punya `ConnectionManager`
+//!    lama. `MultiplexedConnection` adalah Clone dan bisa dipakai langsung.
+//!
+//! 5. **Timeout pada publish** — `publish_with_retry` sekarang selalu dibungkus
+//!    `tokio::time::timeout` agar tidak hang selamanya saat Redis overloaded.
+//!
+//! 6. **Jitter benar** — menggantikan counter monoton (bukan jitter) dengan
+//!    `rand::rng().random::<u64>() % 10` yang acak sungguhan.
+//!
+//! 7. **`critical_queued` decrement di semua exit path** — semaphore tutup,
+//!    maupun selesai normal, keduanya mendekrement dengan benar.
+//!
+//! 8. **`online_drivers()` single-pass** — satu iterasi DashMap, filter by role,
+//!    tanpa cross-lookup ke DashSet lain.
+//!
+//! 9. **`connect()` tanpa NX** — reconnect selalu refresh TTL di Redis.
+//!
+//! 10. **Presence refresher clone key sebelum mutasi** — hindari borrow map
+//!     saat sedang dimodifikasi.
 
 use crate::proto::ridehailing::ServerEvent;
 use ahash::AHasher;
 use anyhow::Result;
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use futures::{stream, StreamExt};
 use prost::Message;
 use redis::AsyncCommands;
@@ -23,6 +52,7 @@ use tokio::sync::{
     mpsc::{self, Receiver, Sender},
     Semaphore,
 };
+use tokio_util::bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 use tonic::Status;
 
@@ -37,55 +67,87 @@ const DECODE_CHANNEL_BUFFER: usize = 2048;
 const SPAWN_CONCURRENCY_LIMIT: usize = 256;
 const PRESENCE_TTL_SECS: u64 = 300;
 const REDIS_PUBLISH_RETRIES: usize = 3;
-const CLEANUP_INTERVAL_SECS: u64 = 30;
+const REDIS_PUBLISH_TIMEOUT_MS: u64 = 500;
 const PRESENCE_BATCH_INTERVAL_SECS: u64 = 55;
 const PRESENCE_BATCH_SIZE: usize = 1000;
-
-// FIX: Batas concurrency untuk fanout di send_to_drivers.
-// 32 = cukup untuk saturate Redis pipeline tanpa spawn terlalu banyak task.
 const FANOUT_CONCURRENCY: usize = 32;
+
+const ROLE_DRIVER: u8 = 0;
+const ROLE_RIDER: u8 = 1;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-type Tx = Sender<Result<ServerEvent, tonic::Status>>;
-type ArcEvent = Arc<ServerEvent>;
-type ArcBytes = Arc<[u8]>;
+type Tx = Sender<Result<ServerEvent, Status>>;
+/// `Bytes` clone adalah O(1) — hanya naikkan refcount, tidak salin data.
+type WireBytes = Bytes;
+
+// ── Session ───────────────────────────────────────────────────────────────────
+
+/// Satu entry per user yang sedang terkoneksi.
+/// Ukuran kecil: Sender (1 ptr) + u8 = ~17 byte.
+struct Session {
+    tx: Tx,
+    role: u8, // ROLE_DRIVER | ROLE_RIDER
+}
 
 // ── Priority ──────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Priority {
-    Critical, // order, driver_matched, payment, WebRTC signaling
-    Normal,   // location_update, chat, browse results
+    Critical,
+    Normal,
 }
 
-// ── Jitter counter ────────────────────────────────────────────────────────────
-//
-// FIX: Ganti SystemTime::now() (syscall tiap retry) dengan atomic counter.
-// Cukup untuk mencegah thundering herd — tidak perlu kriptografi.
-static JITTER_COUNTER: AtomicU64 = AtomicU64::new(0);
+// ── Jitter ────────────────────────────────────────────────────────────────────
 
-fn rand_jitter() -> u64 {
-    JITTER_COUNTER.fetch_add(1, Ordering::Relaxed) % 10
+#[inline]
+fn rand_jitter_ms() -> u64 {
+    // rand 0.9: rand::rng().random() menggantikan rand::random()
+    use rand::Rng;
+    rand::rng().random::<u64>() % 10
+}
+
+// ── Redis connection helper ───────────────────────────────────────────────────
+
+/// Thin wrapper agar MultiplexedConnection terasa sama seperti versi lama.
+/// `MultiplexedConnection` sendiri sudah Clone + Send + Sync di redis 1.x.
+#[derive(Clone)]
+struct RConn(redis::aio::MultiplexedConnection);
+
+impl std::ops::DerefMut for RConn {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+impl std::ops::Deref for RConn {
+    type Target = redis::aio::MultiplexedConnection;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 // ── Sharded publish workers ───────────────────────────────────────────────────
 
 struct ShardedWorkers {
-    senders: Vec<flume::Sender<(String, ArcBytes)>>,
+    senders: Vec<flume::Sender<(String, WireBytes)>>,
 }
 
 impl ShardedWorkers {
-    fn new(redis: Arc<redis::aio::ConnectionManager>, n: usize, buf: usize) -> Self {
+    fn new(redis_client: Arc<redis::Client>, n: usize, buf: usize) -> Self {
         let mut senders = Vec::with_capacity(n);
         for _ in 0..n {
-            let (tx, rx) = flume::bounded::<(String, ArcBytes)>(buf);
+            let (tx, rx) = flume::bounded::<(String, WireBytes)>(buf);
             senders.push(tx);
-            // FIX: redis.clone() — clone Arc, bukan buka koneksi baru.
-            // as_ref().clone() akan clone ConnectionManager di dalamnya (koneksi baru).
-            // Arc::clone hanya increment refcount = O(1), tidak alokasi.
-            let mut conn = (*redis).clone();
+            let client = redis_client.clone();
             tokio::spawn(async move {
+                // Setiap worker punya MultiplexedConnection sendiri
+                let mut conn = match client.get_multiplexed_async_connection().await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!("Pub worker redis connect failed: {}", e);
+                        return;
+                    }
+                };
                 while let Ok((channel, bytes)) = rx.recv_async().await {
                     publish_with_retry(&mut conn, &channel, &bytes).await;
                 }
@@ -94,23 +156,21 @@ impl ShardedWorkers {
         Self { senders }
     }
 
-    async fn send_critical(&self, user_id: &str, channel: String, bytes: ArcBytes) {
-        let idx = shard_index(user_id, self.senders.len());
+    #[inline]
+    fn shard(&self, user_id: &str) -> usize {
+        shard_index(user_id, self.senders.len())
+    }
+
+    async fn send_critical(&self, user_id: &str, channel: String, bytes: WireBytes) {
+        let idx = self.shard(user_id);
         if let Err(e) = self.senders[idx].send_async((channel, bytes)).await {
-            tracing::error!(user_id, "Critical shard closed (worker dead): {}", e);
+            tracing::error!(user_id, "Critical shard closed: {}", e);
         }
     }
 
-    fn send_normal(
-        &self,
-        user_id: &str,
-        channel: String,
-        bytes: ArcBytes,
-        dropped: &Arc<AtomicU64>,
-    ) {
-        let idx = shard_index(user_id, self.senders.len());
+    fn send_normal(&self, user_id: &str, channel: String, bytes: WireBytes, dropped: &AtomicU64) {
+        let idx = self.shard(user_id);
         if self.senders[idx].try_send((channel, bytes)).is_err() {
-            // FIX: increment metric, bukan hanya log
             dropped.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(user_id, shard = idx, "Normal pub shard full, dropping");
         }
@@ -122,30 +182,31 @@ impl ShardedWorkers {
 struct PubWorkers {
     critical: ShardedWorkers,
     normal: ShardedWorkers,
-    dropped_events: Arc<AtomicU64>, // shared dengan ConnectionManager
 }
 
 impl PubWorkers {
-    fn new(redis: Arc<redis::aio::ConnectionManager>, dropped: Arc<AtomicU64>) -> Arc<Self> {
+    fn new(redis_client: Arc<redis::Client>) -> Arc<Self> {
         Arc::new(Self {
             critical: ShardedWorkers::new(
-                redis.clone(),
+                redis_client.clone(),
                 PUB_WORKER_COUNT,
                 PUB_CHANNEL_BUFFER_CRITICAL,
             ),
-            normal: ShardedWorkers::new(redis, PUB_WORKER_COUNT, PUB_CHANNEL_BUFFER_NORMAL),
-            dropped_events: dropped,
+            normal: ShardedWorkers::new(redis_client, PUB_WORKER_COUNT, PUB_CHANNEL_BUFFER_NORMAL),
         })
     }
 
-    async fn publish(&self, user_id: &str, bytes: ArcBytes, priority: Priority) {
+    async fn publish(
+        &self,
+        user_id: &str,
+        bytes: WireBytes,
+        priority: Priority,
+        dropped: &AtomicU64,
+    ) {
         let channel = format!("evt:{}", user_id);
         match priority {
             Priority::Critical => self.critical.send_critical(user_id, channel, bytes).await,
-            Priority::Normal => {
-                self.normal
-                    .send_normal(user_id, channel, bytes, &self.dropped_events)
-            }
+            Priority::Normal => self.normal.send_normal(user_id, channel, bytes, dropped),
         }
     }
 }
@@ -153,32 +214,42 @@ impl PubWorkers {
 // ── ConnectionManager ─────────────────────────────────────────────────────────
 
 pub struct ConnectionManager {
-    channels: DashMap<Arc<str>, Tx>,
-    drivers: DashSet<Arc<str>>,
-    riders: DashSet<Arc<str>>,
-    redis: Arc<redis::aio::ConnectionManager>,
+    /// OPTIMISASI: satu DashMap menggantikan DashMap + 2× DashSet.
+    /// Role disimpan inline di Session — tidak ada cross-lookup.
+    sessions: DashMap<Arc<str>, Session>,
+
+    /// Shared multiplexed connection untuk presence ops.
+    /// Clone adalah O(1) — multiplexer dipakai bersama lewat Arc internal.
+    redis: RConn,
+
+    /// Client untuk buat koneksi pubsub baru saat reconnect.
+    redis_client: Arc<redis::Client>,
+
     pub_workers: Arc<PubWorkers>,
     spawn_sem: Arc<Semaphore>,
-    decode_tx: flume::Sender<(String, ArcBytes)>,
+    decode_tx: flume::Sender<(String, WireBytes)>,
 
     pub dropped_events: Arc<AtomicU64>,
     pub critical_queued: Arc<AtomicU64>,
 }
 
 impl ConnectionManager {
-    pub fn new(redis: redis::aio::ConnectionManager, redis_client: redis::Client) -> Arc<Self> {
-        let redis = Arc::new(redis);
+    pub async fn new(redis_client: redis::Client) -> Result<Arc<Self>> {
+        let redis_client = Arc::new(redis_client);
+        let conn = redis_client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| anyhow::anyhow!("Redis connect: {}", e))?;
 
         let dropped_events = Arc::new(AtomicU64::new(0));
-        let pub_workers = PubWorkers::new(redis.clone(), Arc::clone(&dropped_events));
-
-        let (decode_tx, decode_rx) = flume::bounded::<(String, ArcBytes)>(DECODE_CHANNEL_BUFFER);
+        let pub_workers = PubWorkers::new(redis_client.clone());
+        let (decode_tx, decode_rx) = flume::bounded::<(String, WireBytes)>(DECODE_CHANNEL_BUFFER);
 
         let mgr = Arc::new(Self {
-            channels: DashMap::with_capacity_and_shard_amount(1024, 16),
-            drivers: DashSet::new(),
-            riders: DashSet::new(),
-            redis,
+            // dashmap 6: with_capacity_and_shard_amount dihapus
+            sessions: DashMap::with_capacity(1024),
+            redis: RConn(conn),
+            redis_client,
             pub_workers,
             spawn_sem: Arc::new(Semaphore::new(SPAWN_CONCURRENCY_LIMIT)),
             decode_tx,
@@ -186,19 +257,29 @@ impl ConnectionManager {
             critical_queued: Arc::new(AtomicU64::new(0)),
         });
 
+        Self::spawn_decode_workers(&mgr, decode_rx);
+        Self::spawn_shared_subscriber(mgr.clone());
+        Self::spawn_global_presence_refresher(mgr.clone());
+
+        Ok(mgr)
+    }
+
+    // ── Decode workers ────────────────────────────────────────────────────────
+
+    fn spawn_decode_workers(mgr: &Arc<Self>, decode_rx: flume::Receiver<(String, WireBytes)>) {
         for _ in 0..DECODE_WORKER_COUNT {
             let mgr_w = mgr.clone();
-            let rx_clone = decode_rx.clone();
+            let rx = decode_rx.clone();
             tokio::spawn(async move {
-                while let Ok((user_id, bytes)) = rx_clone.recv_async().await {
+                while let Ok((user_id, bytes)) = rx.recv_async().await {
+                    // Decode dari Bytes — zero-copy, tidak ada Vec alokasi baru
                     match ServerEvent::decode(bytes.as_ref()) {
                         Ok(event) => {
-                            if let Some(tx) = mgr_w.channels.get(&*user_id) {
-                                if tx.try_send(Ok(event)).is_err() {
-                                    // FIX: increment dropped juga di decode pool
+                            if let Some(session) = mgr_w.sessions.get(&*user_id) {
+                                if session.tx.try_send(Ok(event)).is_err() {
                                     mgr_w.dropped_events.fetch_add(1, Ordering::Relaxed);
-                                    drop(tx);
-                                    mgr_w.channels.remove(&*user_id);
+                                    drop(session); // lepas guard sebelum mutasi
+                                    mgr_w.sessions.remove(&*user_id);
                                 }
                             }
                         }
@@ -207,22 +288,18 @@ impl ConnectionManager {
                 }
             });
         }
-
-        Self::spawn_shared_subscriber(mgr.clone(), redis_client);
-        Self::spawn_global_presence_refresher(mgr.clone());
-
-        mgr
     }
 
     // ── Redis Subscriber ──────────────────────────────────────────────────────
 
-    fn spawn_shared_subscriber(mgr: Arc<Self>, redis_client: redis::Client) {
+    fn spawn_shared_subscriber(mgr: Arc<Self>) {
         let decode_tx = mgr.decode_tx.clone();
         let dropped = Arc::clone(&mgr.dropped_events);
+        let client = mgr.redis_client.clone();
 
         tokio::spawn(async move {
             loop {
-                match redis_client.get_async_pubsub().await {
+                match client.get_async_pubsub().await {
                     Ok(mut pubsub) => {
                         if let Err(e) = pubsub.psubscribe("evt:*").await {
                             tracing::error!("psubscribe failed: {}", e);
@@ -245,12 +322,12 @@ impl ConnectionManager {
                                     continue;
                                 }
                             };
-                            let bytes: ArcBytes = raw.into();
+                            // Vec → Bytes: O(1), tidak ada copy
+                            let bytes = Bytes::from(raw);
 
                             if decode_tx.try_send((user_id, bytes)).is_err() {
-                                // FIX: increment dropped di subscriber juga
                                 dropped.fetch_add(1, Ordering::Relaxed);
-                                tracing::warn!("Decode pool full, dropping incoming message");
+                                tracing::warn!("Decode pool full, dropping");
                             }
                         }
                         tracing::warn!("Redis subscriber disconnected, reconnecting...");
@@ -262,49 +339,71 @@ impl ConnectionManager {
         });
     }
 
-    // ── Global Presence Refresher ─────────────────────────────────────────────
+    // ── Presence Refresher ────────────────────────────────────────────────────
 
     fn spawn_global_presence_refresher(mgr: Arc<Self>) {
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(PRESENCE_BATCH_INTERVAL_SECS));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+            // RConn: Clone adalah O(1) — berbagi multiplexer yang sama
+            let mut conn = mgr.redis.clone();
+
             loop {
                 tick.tick().await;
 
-                // FIX: (*mgr.redis).clone() — clone Arc isi, bukan buka koneksi baru
-                let mut conn = (*mgr.redis).clone();
                 let mut pipe = redis::pipe();
-                let mut count = 0usize;
+                let mut pipe_count = 0usize;
                 let mut total = 0usize;
 
-                for entry in mgr.channels.iter() {
-                    let uid = entry.key();
-                    let role = if mgr.drivers.contains(uid.as_ref()) {
-                        "driver"
-                    } else if mgr.riders.contains(uid.as_ref()) {
-                        "rider"
-                    } else {
-                        continue;
-                    };
+                // OPTIMISASI: kumpulkan stale key dulu, mutasi map setelah iterasi selesai
+                let mut stale: Vec<Arc<str>> = Vec::new();
 
-                    pipe.set_ex(format!("online:{}", uid), role, PRESENCE_TTL_SECS);
-                    count += 1;
+                for entry in mgr.sessions.iter() {
+                    let uid = entry.key().clone(); // Arc<str> clone = murah
+                    let session = entry.value();
+
+                    if session.tx.is_closed() {
+                        stale.push(uid);
+                        continue;
+                    }
+
+                    let role_str = if session.role == ROLE_DRIVER {
+                        "driver"
+                    } else {
+                        "rider"
+                    };
+                    pipe.set_ex(format!("online:{}", uid), role_str, PRESENCE_TTL_SECS);
+                    pipe_count += 1;
                     total += 1;
 
-                    if count >= PRESENCE_BATCH_SIZE {
-                        if let Err(e) = pipe.query_async::<()>(&mut conn).await {
+                    if pipe_count >= PRESENCE_BATCH_SIZE {
+                        if let Err(e) = pipe.query_async::<()>(&mut *conn).await {
                             tracing::warn!("Presence batch flush failed: {}", e);
                         }
                         pipe = redis::pipe();
-                        count = 0;
+                        pipe_count = 0;
                     }
                 }
 
-                if count > 0 {
-                    if let Err(e) = pipe.query_async::<()>(&mut conn).await {
+                if pipe_count > 0 {
+                    if let Err(e) = pipe.query_async::<()>(&mut *conn).await {
                         tracing::warn!("Presence final flush failed: {}", e);
                     }
+                }
+
+                if !stale.is_empty() {
+                    let redis_keys: Vec<String> =
+                        stale.iter().map(|u| format!("online:{}", u)).collect();
+                    let stale_count = stale.len();
+
+                    if let Err(e) = conn.del::<_, ()>(redis_keys).await {
+                        tracing::warn!("Stale Redis del failed: {}", e);
+                    }
+                    for uid in stale {
+                        mgr.sessions.remove(&uid);
+                    }
+                    tracing::debug!("Removed {} stale sessions", stale_count);
                 }
 
                 if total > 0 {
@@ -314,135 +413,111 @@ impl ConnectionManager {
         });
     }
 
-    // ── Connect / Disconnect ──────────────────────────────────────────────────
+    // ── Connect ───────────────────────────────────────────────────────────────
 
     pub async fn connect(
         &self,
         user_id: &str,
         role: &str,
-    ) -> (
-        Receiver<Result<ServerEvent, tonic::Status>>,
-        CancellationToken,
-    ) {
+    ) -> (Receiver<Result<ServerEvent, Status>>, CancellationToken) {
         let (tx, rx) = mpsc::channel(CHANNEL_BUFFER);
         let key: Arc<str> = user_id.into();
+        let role_byte = if role == "driver" {
+            ROLE_DRIVER
+        } else {
+            ROLE_RIDER
+        };
 
-        // 🔥 cleanup existing connection (IMPORTANT)
-        if let Some((_, old_tx)) = self.channels.remove(&key) {
+        // Atomik: remove lama + insert baru dalam satu shard lock sequence
+        if let Some((_, old)) = self.sessions.remove(&key) {
             tracing::warn!(user_id, "Replacing existing connection");
-            self.drivers.remove(key.as_ref());
-            self.riders.remove(key.as_ref());
-
-            let _ = old_tx.try_send(Err(Status::cancelled("Replaced by new connection")));
+            let _ = old
+                .tx
+                .try_send(Err(Status::cancelled("Replaced by new connection")));
         }
+        self.sessions.insert(
+            key,
+            Session {
+                tx,
+                role: role_byte,
+            },
+        );
 
-        self.channels.insert(key.clone(), tx);
-
-        // Jika user reconnect dengan role berbeda, bersihkan set lama dulu
-        match role {
-            "driver" => {
-                self.riders.remove(key.as_ref());
-                self.drivers.insert(key);
-            }
-            "rider" => {
-                self.drivers.remove(key.as_ref());
-                self.riders.insert(key);
-            }
-            _ => tracing::warn!(user_id, role, "Unknown role in connect()"),
-        }
-
-        // NX: set only if not exists — cegah ghost overwrite saat race reconnect
-        let mut redis = (*self.redis).clone();
-        if let Err(e) = redis
-            .set_options::<_, _, ()>(
-                format!("online:{}", user_id),
-                role,
-                redis::SetOptions::default()
-                    .with_expiration(redis::SetExpiry::EX(PRESENCE_TTL_SECS))
-                    .conditional_set(redis::ExistenceCheck::NX),
-            )
+        // FIX: tidak pakai NX — reconnect harus refresh TTL
+        let mut conn = self.redis.clone();
+        if let Err(e) = conn
+            .set_ex::<_, _, ()>(format!("online:{}", user_id), role, PRESENCE_TTL_SECS)
             .await
         {
-            tracing::error!(user_id, error = %e, "Failed to set presence in Redis");
+            tracing::error!(user_id, error = %e, "Failed to set presence");
         }
 
         (rx, CancellationToken::new())
     }
 
+    // ── Disconnect ────────────────────────────────────────────────────────────
+
     pub async fn disconnect(&self, user_id: &str, cancel: CancellationToken) {
         cancel.cancel();
-
-        self.channels.remove(user_id);
-        self.drivers.remove(user_id);
-        self.riders.remove(user_id);
-
-        let mut redis = (*self.redis).clone();
-        let _: Result<(), _> = redis.del(format!("online:{}", user_id)).await;
+        self.sessions.remove(user_id);
+        let mut conn = self.redis.clone();
+        if let Err(e) = conn.del::<_, ()>(format!("online:{}", user_id)).await {
+            tracing::warn!(user_id, "Failed to del presence: {}", e);
+        }
     }
-
-    // ── Register ──────────────────────────────────────────────────────────────
-    //
-    // FIX: register_* hanya update set lokal — tidak menyentuh Redis.
-    // Alasan:
-    //   1. connect() sudah set Redis presence dengan NX.
-    //   2. presence_refresher akan refresh TTL setiap 55 detik.
-    //   3. set_ex di sini akan overwrite key NX yang baru saja di-set di connect(),
-    //      yang bisa menyebabkan race condition di multi-node.
-    //
-    // Jika ada skenario register dipanggil tanpa connect() sebelumnya
-    // (misal: pre-register sebelum WebSocket tersambung), tambahkan Redis call
-    // di sini secara eksplisit dengan komentar yang jelas.
 
     // ── Send ──────────────────────────────────────────────────────────────────
 
-    pub fn send(&self, user_id: &str, event: ArcEvent, priority: Priority) {
-        // Local fast-path: tidak encode sama sekali kalau user ada di node ini
-        if let Some(tx) = self.channels.get(user_id) {
-            match tx.try_send(Ok((*event).clone())) {
+    pub fn send(&self, user_id: &str, event: Arc<ServerEvent>, priority: Priority) {
+        if let Some(session) = self.sessions.get(user_id) {
+            match session.tx.try_send(Ok((*event).clone())) {
                 Ok(_) => return,
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     tracing::warn!(user_id, "Channel full, forcing disconnect");
-                    // FIX: hapus try_send error — channel sudah penuh, hampir pasti gagal.
-                    // Langsung drop dan increment metric, client akan reconnect.
-                    drop(tx);
-                    self.channels.remove(user_id);
+                    drop(session);
+                    self.sessions.remove(user_id);
                     self.dropped_events.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
-                    drop(tx);
-                    self.channels.remove(user_id);
-                    // Fallthrough ke Redis: user mungkin sudah reconnect ke node lain
+                    drop(session);
+                    self.sessions.remove(user_id);
+                    // fallthrough ke remote path
                 }
             }
         }
 
-        // Remote path: encode hanya di sini
-        let bytes: ArcBytes = event.encode_to_vec().into();
+        // OPTIMISASI: encode_to_vec() lalu bungkus dalam Bytes — clone O(1)
+        let bytes: WireBytes = Bytes::from(event.encode_to_vec());
         let workers = self.pub_workers.clone();
         let uid = user_id.to_string();
+        let dropped = Arc::clone(&self.dropped_events);
 
         match priority {
             Priority::Normal => {
-                workers.normal.send_normal(
-                    &uid,
-                    format!("evt:{}", uid),
-                    bytes,
-                    &self.dropped_events,
-                );
+                workers
+                    .normal
+                    .send_normal(&uid, format!("evt:{}", uid), bytes, &dropped);
             }
             Priority::Critical => {
                 self.critical_queued.fetch_add(1, Ordering::Relaxed);
                 let sem = self.spawn_sem.clone();
                 let cq = Arc::clone(&self.critical_queued);
+
                 tokio::spawn(async move {
-                    let Ok(_permit) = sem.acquire_owned().await else {
-                        return;
+                    // FIX: decrement di SEMUA exit path
+                    let permit = match sem.acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => {
+                            cq.fetch_sub(1, Ordering::Relaxed);
+                            return;
+                        }
                     };
                     workers
                         .critical
                         .send_critical(&uid, format!("evt:{}", uid), bytes)
                         .await;
+                    drop(permit);
                     cq.fetch_sub(1, Ordering::Relaxed);
                 });
             }
@@ -450,22 +525,30 @@ impl ConnectionManager {
     }
 
     // ── Send to Drivers ───────────────────────────────────────────────────────
-    //
-    // FIX: remote fanout sekarang concurrent dengan for_each_concurrent(FANOUT_CONCURRENCY).
-    // Sebelumnya: sequential await per driver = total_latency = N × redis_latency.
-    // Sekarang:   32 publish jalan paralel = total_latency ≈ ceil(N/32) × redis_latency.
-    // Contoh: 1000 driver, 1ms/publish → sebelum: 1000ms, sekarang: ~32ms.
 
-    pub fn send_to_drivers(&self, driver_ids: Vec<String>, event: ArcEvent, priority: Priority) {
+    pub fn send_to_drivers(
+        &self,
+        driver_ids: Vec<String>,
+        event: Arc<ServerEvent>,
+        priority: Priority,
+    ) {
+        // Encode sekali di sini — clone WireBytes setelah ini adalah O(1)
+        let bytes: WireBytes = Bytes::from(event.encode_to_vec());
         let mut remote_ids: Vec<String> = Vec::new();
 
         for driver_id in &driver_ids {
-            if let Some(tx) = self.channels.get(driver_id.as_str()) {
-                if tx.try_send(Ok((*event).clone())).is_ok() {
+            if let Some(session) = self.sessions.get(driver_id.as_str()) {
+                // OPTIMISASI: cek role inline, tidak perlu lookup DashSet lain
+                if session.role != ROLE_DRIVER {
                     continue;
                 }
-                drop(tx);
-                self.channels.remove(driver_id.as_str());
+                match session.tx.try_send(Ok((*event).clone())) {
+                    Ok(_) => continue,
+                    Err(_) => {
+                        drop(session);
+                        self.sessions.remove(driver_id.as_str());
+                    }
+                }
             }
             remote_ids.push(driver_id.clone());
         }
@@ -474,22 +557,23 @@ impl ConnectionManager {
             return;
         }
 
-        let bytes: ArcBytes = event.encode_to_vec().into();
         let workers = self.pub_workers.clone();
         let sem = self.spawn_sem.clone();
+        let dropped = Arc::clone(&self.dropped_events);
 
         tokio::spawn(async move {
             let Ok(_permit) = sem.acquire_owned().await else {
                 return;
             };
 
-            // FIX: concurrent fanout — FANOUT_CONCURRENCY publish jalan bersamaan
             stream::iter(remote_ids)
                 .for_each_concurrent(FANOUT_CONCURRENCY, |driver_id| {
                     let w = workers.clone();
-                    let b = Arc::clone(&bytes);
+                    // Bytes::clone() = O(1), tidak ada copy data
+                    let b = bytes.clone();
+                    let d = dropped.clone();
                     async move {
-                        w.publish(&driver_id, b, priority).await;
+                        w.publish(&driver_id, b, priority, &d).await;
                     }
                 })
                 .await;
@@ -499,101 +583,72 @@ impl ConnectionManager {
     // ── Query ─────────────────────────────────────────────────────────────────
 
     pub async fn is_connected(&self, user_id: &str) -> Result<bool> {
-        if self.channels.contains_key(user_id) {
+        if self.sessions.contains_key(user_id) {
             return Ok(true);
         }
-        let mut redis = (*self.redis).clone();
-        let exist = redis
-            .exists::<_, bool>(format!("online:{}", user_id))
-            .await?;
+        let mut conn = self.redis.clone();
+        let exist: bool = conn.exists(format!("online:{}", user_id)).await?;
         Ok(exist)
     }
 
+    /// OPTIMISASI: single-pass, tidak ada cross-lookup ke DashSet
     pub fn online_drivers(&self) -> Vec<String> {
-        self.drivers
+        self.sessions
             .iter()
-            .filter(|id| self.channels.contains_key(id.as_ref()))
-            .map(|id| id.to_string())
+            .filter(|e| e.value().role == ROLE_DRIVER)
+            .map(|e| e.key().to_string())
             .collect()
     }
 
     pub fn online_users(&self) -> Vec<String> {
-        self.channels.iter().map(|e| e.key().to_string()).collect()
+        self.sessions.iter().map(|e| e.key().to_string()).collect()
     }
 
     // ── Metrics ───────────────────────────────────────────────────────────────
 
-    /// Total event yang di-drop: channel penuh, queue overflow, atau decode pool penuh
     pub fn dropped_events(&self) -> u64 {
         self.dropped_events.load(Ordering::Relaxed)
     }
 
-    /// Total event critical yang sedang di-queue ke Redis (inflight)
     pub fn critical_queued(&self) -> u64 {
         self.critical_queued.load(Ordering::Relaxed)
     }
 
-    /// (total_connections, connections_with_low_buffer)
     pub fn queue_depths(&self) -> (usize, usize) {
         let low = self
-            .channels
+            .sessions
             .iter()
-            .filter(|e| e.value().capacity() < CHANNEL_BUFFER / 4)
+            .filter(|e| e.value().tx.capacity() < CHANNEL_BUFFER / 4)
             .count();
-        (self.channels.len(), low)
-    }
-
-    // ── Cleanup ───────────────────────────────────────────────────────────────
-
-    pub fn spawn_cleanup(self: &Arc<Self>) {
-        let mgr = Arc::clone(self);
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(CLEANUP_INTERVAL_SECS));
-            loop {
-                tick.tick().await;
-
-                let stale: Vec<Arc<str>> = mgr
-                    .channels
-                    .iter()
-                    .filter(|e| e.value().is_closed())
-                    .map(|e| e.key().clone())
-                    .collect();
-
-                if stale.is_empty() {
-                    continue;
-                }
-
-                let mut conn = (*mgr.redis).clone();
-                let keys: Vec<String> = stale.iter().map(|uid| format!("online:{}", uid)).collect();
-                if let Err(e) = conn.del::<_, ()>(keys).await {
-                    tracing::warn!("Cleanup Redis del failed: {}", e);
-                }
-
-                for uid in &stale {
-                    mgr.channels.remove(uid.as_ref());
-                    mgr.drivers.remove(uid.as_ref());
-                    mgr.riders.remove(uid.as_ref());
-                }
-
-                tracing::info!("Cleanup: removed {} stale connections", stale.len());
-            }
-        });
+        (self.sessions.len(), low)
     }
 }
 
 // ── Standalone helpers ────────────────────────────────────────────────────────
 
+#[inline]
 fn shard_index(user_id: &str, n: usize) -> usize {
     let mut hasher = AHasher::default();
     user_id.hash(&mut hasher);
     (hasher.finish() as usize) % n
 }
 
-async fn publish_with_retry(conn: &mut redis::aio::ConnectionManager, channel: &str, bytes: &[u8]) {
+async fn publish_with_retry(
+    conn: &mut redis::aio::MultiplexedConnection,
+    channel: &str,
+    bytes: &[u8],
+) {
     for attempt in 0..REDIS_PUBLISH_RETRIES {
-        match conn.publish::<_, _, ()>(channel, bytes).await {
-            Ok(_) => return,
-            Err(e) if attempt + 1 == REDIS_PUBLISH_RETRIES => {
+        // FIX: selalu bungkus dengan timeout agar tidak hang selamanya
+        let result = tokio::time::timeout(
+            Duration::from_millis(REDIS_PUBLISH_TIMEOUT_MS),
+            conn.publish::<_, _, ()>(channel, bytes),
+        )
+        .await;
+
+        match result {
+            Ok(Ok(_)) => return,
+            Ok(Err(e)) if attempt + 1 == REDIS_PUBLISH_RETRIES => {
                 tracing::error!(
                     channel,
                     "Redis publish failed after {} retries: {}",
@@ -601,11 +656,34 @@ async fn publish_with_retry(conn: &mut redis::aio::ConnectionManager, channel: &
                     e
                 );
             }
-            Err(e) => {
-                let base_ms = 20u64 * (1 << attempt);
-                let jitter = rand_jitter();
-                tracing::warn!(channel, attempt, "Redis publish retry: {}", e);
-                tokio::time::sleep(Duration::from_millis(base_ms + jitter)).await;
+            Ok(Err(e)) => {
+                let delay = 20u64 * (1 << attempt) + rand_jitter_ms();
+                tracing::warn!(
+                    channel,
+                    attempt,
+                    "Redis publish error: {}, retry in {}ms",
+                    e,
+                    delay
+                );
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+            Err(_timeout) => {
+                if attempt + 1 == REDIS_PUBLISH_RETRIES {
+                    tracing::error!(
+                        channel,
+                        "Redis publish timed out after {} retries",
+                        REDIS_PUBLISH_RETRIES
+                    );
+                } else {
+                    let delay = 20u64 * (1 << attempt) + rand_jitter_ms();
+                    tracing::warn!(
+                        channel,
+                        attempt,
+                        "Redis publish timeout, retry in {}ms",
+                        delay
+                    );
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                }
             }
         }
     }

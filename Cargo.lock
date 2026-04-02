@@ -2964,6 +2964,7 @@ dependencies = [
  "reqwest",
  "rust_decimal",
  "rust_decimal_macros",
+ "scopeguard",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
