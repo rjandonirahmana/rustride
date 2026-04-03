@@ -56,23 +56,20 @@ pub fn order_to_proto(o: &Order) -> crate::proto::order::Order {
     }
 }
 
-fn status_event(
-    order_id: &str,
-    status: &str,
-    service_type: &str,
-    fare_estimate: &i32,
-    rider_id: &str,
-    rider_name: &str,
-) -> Arc<ServerEvent> {
+fn status_event(order: &Order) -> Arc<ServerEvent> {
     Arc::new(ServerEvent {
         payload: Some(Sp::OrderStatus(OrderStatusEvent {
-            order_id: order_id.to_string(),
-            status: status.to_string(),
+            order_id: order.id.to_string(),
+            status: order.status.to_string(),
             driver: None,
-            service_type: service_type.to_string(),
-            fare_estimate: *fare_estimate,
-            rider_id: rider_id.to_string(),
-            rider_name: rider_name.to_string(),
+            service_type: order.service_type.to_string(),
+            fare_estimate: order.fare_estimate,
+            rider_id: order.rider_id.to_string(),
+            rider_name: order.rider_name.to_string(),
+            dest_lat: order.dest_lat,
+            dest_lng: order.dest_lng,
+            pickup_lat: order.pickup_lat,
+            pickup_lng: order.pickup_lng,
         })),
     })
 }
@@ -154,18 +151,8 @@ where
         let order = self.order_repo.create(order).await?;
 
         // Push status "searching" ke rider
-        self.connections.send(
-            &rider_id,
-            status_event(
-                &order.id,
-                "searching",
-                &order.service_type,
-                &order.fare_estimate,
-                &order.rider_id,
-                &order.rider_name,
-            ),
-            Priority::Normal,
-        );
+        self.connections
+            .send(&rider_id, status_event(&order), Priority::Normal);
 
         // Spawn background driver matching:
         // 1. notify_nearby_drivers — push NewOrder langsung ke semua driver terdekat (immediate)
@@ -449,6 +436,10 @@ where
                                 fare_estimate: order.fare_estimate,
                                 rider_id: order.rider_id.clone(),
                                 rider_name: order.rider_name.clone(),
+                                dest_lat: order.dest_lat,
+                                dest_lng: order.dest_lng,
+                                pickup_lat: order.pickup_lat,
+                                pickup_lng: order.pickup_lng,
                             })),
                         }),
                         Priority::Normal,
@@ -580,6 +571,10 @@ where
                     fare_estimate: order.fare_estimate,
                     rider_id: order.rider_id.clone(),
                     rider_name: order.rider_name.clone(),
+                    dest_lat: order.dest_lat,
+                    dest_lng: order.dest_lng,
+                    pickup_lat: order.pickup_lat,
+                    pickup_lng: order.pickup_lng,
                 })),
             }),
             Priority::Normal,
@@ -597,6 +592,10 @@ where
                     fare_estimate: order.fare_estimate,
                     rider_id: order.rider_id,
                     rider_name: order.rider_name,
+                    dest_lat: order.dest_lat,
+                    dest_lng: order.dest_lng,
+                    pickup_lat: order.pickup_lat,
+                    pickup_lng: order.pickup_lng,
                 })),
             }),
             Priority::Normal,
@@ -614,30 +613,10 @@ where
         self.order_repo
             .update_status(order_id, "driver_arrived")
             .await?;
-        self.connections.send(
-            &order.rider_id,
-            status_event(
-                order_id,
-                "driver_arrived",
-                &order.service_type,
-                &order.fare_estimate,
-                &order.rider_id,
-                &order.rider_name,
-            ),
-            Priority::Normal,
-        );
-        self.connections.send(
-            driver_id,
-            status_event(
-                order_id,
-                "driver_arrived",
-                &order.service_type,
-                &order.fare_estimate,
-                &order.rider_id,
-                &order.rider_name,
-            ),
-            Priority::Normal,
-        );
+        self.connections
+            .send(&order.rider_id, status_event(&order), Priority::Normal);
+        self.connections
+            .send(driver_id, status_event(&order), Priority::Normal);
         Ok(())
     }
 
@@ -647,30 +626,10 @@ where
             .get_order_for_driver(driver_id, order_id, "driver_arrived")
             .await?;
         self.order_repo.update_status(order_id, "on_trip").await?;
-        self.connections.send(
-            &order.rider_id,
-            status_event(
-                order_id,
-                "on_trip",
-                &order.service_type,
-                &order.fare_estimate,
-                &order.rider_id,
-                &order.rider_name,
-            ),
-            Priority::Normal,
-        );
-        self.connections.send(
-            driver_id,
-            status_event(
-                order_id,
-                "on_trip",
-                &order.service_type,
-                &order.fare_estimate,
-                &order.rider_id,
-                &order.rider_name,
-            ),
-            Priority::Normal,
-        );
+        self.connections
+            .send(&order.rider_id, status_event(&order), Priority::Normal);
+        self.connections
+            .send(driver_id, status_event(&order), Priority::Normal);
         Ok(())
     }
 
@@ -682,30 +641,10 @@ where
         let fare = calculate_fare(dist_km as f64, &order.service_type);
         self.order_repo.complete(order_id, dist_km, fare).await?;
         let _ = self.location.clear_driver_order(driver_id).await;
-        self.connections.send(
-            &order.rider_id,
-            status_event(
-                order_id,
-                "completed",
-                &order.service_type,
-                &order.fare_estimate,
-                &order.rider_id,
-                &order.rider_name,
-            ),
-            Priority::Normal,
-        );
-        self.connections.send(
-            driver_id,
-            status_event(
-                order_id,
-                "completed",
-                &order.service_type,
-                &order.fare_estimate,
-                &order.rider_id,
-                &order.rider_name,
-            ),
-            Priority::Normal,
-        );
+        self.connections
+            .send(&order.rider_id, status_event(&order), Priority::Normal);
+        self.connections
+            .send(driver_id, status_event(&order), Priority::Normal);
         Ok(())
     }
 
@@ -757,31 +696,11 @@ where
         self.order_repo.cancel(order_id, reason.as_deref()).await?;
 
         if role == "driver" {
-            self.connections.send(
-                &order.rider_id,
-                status_event(
-                    order_id,
-                    "cancelled",
-                    &order.service_type,
-                    &order.fare_estimate,
-                    &order.rider_id,
-                    &order.rider_name,
-                ),
-                Priority::Normal,
-            );
+            self.connections
+                .send(&order.rider_id, status_event(&order), Priority::Normal);
         }
-        self.connections.send(
-            user_id,
-            status_event(
-                order_id,
-                "cancelled",
-                &order.service_type,
-                &order.fare_estimate,
-                &order.rider_id,
-                &order.rider_name,
-            ),
-            Priority::Normal,
-        );
+        self.connections
+            .send(user_id, status_event(&order), Priority::Normal);
         Ok(())
     }
 

@@ -92,3 +92,4 @@ message DriverLocationMeta {
   double speed   = 4;
   int64  ts      = 5;
 }
+

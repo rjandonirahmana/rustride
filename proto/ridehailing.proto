@@ -36,7 +36,6 @@ message ClientEvent {
     EndCallReq         end_call         = 35;
     EstimateFareReq    estimate_fare    = 36;
     RateReq            rate             = 37;
-
   }
 }
 
@@ -50,7 +49,7 @@ message ServerEvent {
     NewOrderOffer                     new_order         = 7;
     OrderStatusEvent                  order_status      = 8;
     DriverLocationEvent               driver_loc        = 9;
-    message.NewMessageEvent           new_message       = 10;  // push dari server
+    message.NewMessageEvent           new_message       = 10;
     ReadReceiptEvent                  read_receipt      = 12;
     PresenceEvent                     presence          = 13;
     RatedEvent                        rated             = 15;
@@ -73,19 +72,12 @@ message ServerEvent {
 
 // ── Shared ────────────────────────────────────────────────────
 message PingReq          {}
-
 message PongEvent        {}
-
 message ConnectedEvent   { string user_id = 1; string role = 2; string username = 3; string vehicle_type = 4; }
-
 message ErrorEvent       { string code = 1; string message = 2; }
-
 message RatedEvent       { string order_id = 1; uint32 rating = 2; }
-
 message WatchUserReq     { string target_user_id = 1; }
-
 message ReadReceiptEvent { string from_user_id = 1; string read_at = 2; }
-
 message PresenceEvent    { string user_id = 1; bool online = 2; string last_seen = 3; }
 
 message EstimateFareReq {
@@ -120,25 +112,16 @@ message NotificationItem {
 
 // ── Ride-hailing ──────────────────────────────────────────────
 message WatchDriversReq { double lat = 1; double lng = 2; string service_type = 3; }
-
 message LocationUpdate  { double lat = 1; double lng = 2; float heading = 3; float speed = 4; }
-
 message BrowseOrdersReq { double lat = 1; double lng = 2; string service_type = 3; float radius_km = 4; }
-
 message AcceptOrderReq  { string order_id = 1; }
-
 message RejectOrderReq  { string order_id = 1; }
-
 message ArrivedReq      { string order_id = 1; }
-
 message StartTripReq    { string order_id = 1; }
-
 message CompleteTripReq { string order_id = 1; float distance_km = 2; }
-
 message CancelTripReq   { string order_id = 1; string reason = 2; }
 
 message NearbyDriversEvent { repeated NearbyDriverItem drivers = 1; }
-
 message NearbyDriverItem {
   string driver_id  = 1;
   double lat        = 2;
@@ -148,7 +131,6 @@ message NearbyDriverItem {
 }
 
 message NearbyOrdersEvent { repeated NearbyOrderItem orders = 1; uint32 total = 2; }
-
 message NearbyOrderItem   { order.Order order = 1; float distance_to_pickup_m = 2; float eta_to_pickup_min = 3; }
 
 message NewOrderOffer {
@@ -158,6 +140,7 @@ message NewOrderOffer {
   uint32      timeout_secs         = 4;
 }
 
+// ✅ Perbaikan utama: tambahkan pickup_lat, pickup_lng, dest_lat, dest_lng
 message OrderStatusEvent {
   string           order_id      = 1;
   string           status        = 2;
@@ -166,13 +149,16 @@ message OrderStatusEvent {
   int32            fare_estimate = 5;
   string           rider_id      = 6;
   string           rider_name    = 7;
+  double           pickup_lat    = 8; // tambahan
+  double           pickup_lng    = 9; // tambahan
+  double           dest_lat      = 10; // tambahan
+  double           dest_lng      = 11; // tambahan
 }
 
 message DriverLocationEvent { string order_id = 1; double lat = 2; double lng = 3; float heading = 4; }
 
-// ── Rideshare ─────────────────────────────────────────────────
+// ── Rideshare ── (tidak berubah)
 message OpenRideshareReq   { string order_id = 1; int32 max_passengers = 2; int32 join_deadline_s = 3; }
-
 message BrowseRideshareReq {
   double dest_lat     = 1;
   double dest_lng     = 2;
@@ -181,7 +167,6 @@ message BrowseRideshareReq {
   string service_type = 5;
   float  radius_km    = 6;
 }
-
 message JoinRideshareReq {
   string trip_id        = 1;
   double pickup_lat     = 2;
@@ -191,23 +176,14 @@ message JoinRideshareReq {
   double dest_lng       = 6;
   string dest_address   = 7;
 }
-
 message CancelRideshareReq { string passenger_id = 1; string trip_id = 2; string reason = 3; }
-
 message AcceptPassengerReq { string passenger_id = 1; string trip_id = 2; }
-
 message RejectPassengerReq { string passenger_id = 1; string trip_id = 2; string reason = 3; }
-
 message PickupPassengerReq { string passenger_id = 1; string trip_id = 2; }
-
 message DropPassengerReq   { string passenger_id = 1; string trip_id = 2; float distance_km = 3; }
-
 message NearbyRideshareEvent  { repeated RideshareItem trips = 1; }
-
 message RideshareJoinedEvent  { string passenger_id = 1; string trip_id = 2; int32 fare_estimate = 3; string status = 4; }
-
 message RideshareOpenedEvent  { string trip_id = 1; string order_id = 2; int32 max_passengers = 3; }
-
 message RideshareItem {
   string trip_id         = 1;
   string driver_id       = 2;
@@ -227,7 +203,6 @@ message RideshareItem {
   float  distance_km     = 16;
   string join_deadline   = 17;
 }
-
 message PassengerRequestEvent {
   string passenger_id   = 1;
   string trip_id        = 2;
@@ -243,7 +218,6 @@ message PassengerRequestEvent {
   int32  fare_estimate  = 12;
   float  distance_km    = 13;
 }
-
 message PassengerStatusEvent {
   string passenger_id  = 1;
   string trip_id       = 2;
@@ -251,7 +225,6 @@ message PassengerStatusEvent {
   string reason        = 4;
   int32  fare_estimate = 5;
 }
-
 message RideshareStatusEvent {
   string trip_id          = 1;
   string status           = 2;
@@ -260,19 +233,12 @@ message RideshareStatusEvent {
   string passenger_status = 5;
 }
 
-// ── WebRTC ────────────────────────────────────────────────────
+// ── WebRTC ── (tidak berubah)
 message CallOffer          { string target_user_id = 1; string sdp = 2; string order_id = 3; }
-
 message CallAnswer         { string caller_id = 1; string sdp = 2; }
-
 message IceCandidate       { string peer_id = 1; string candidate = 2; }
-
 message EndCallReq         { string peer_id = 1; }
-
 message IncomingCallOffer  { string caller_id = 1; string sdp = 2; }
-
 message IncomingCallAnswer { string callee_id = 1; string sdp = 2; }
-
 message IceCandidateEvent  { string peer_id = 1; string candidate = 2; }
-
 message CallEndedEvent     { string peer_id = 1; }
