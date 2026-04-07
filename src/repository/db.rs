@@ -69,6 +69,19 @@ pub fn f32_col(row: &Row, name: &str) -> Result<f32> {
         .with_context(|| format!("f32_col '{}' failed", name))
 }
 
+pub fn i32_col(row: &Row, name: &str) -> Result<i32> {
+    // Coba i64 dulu (covers int8, int4, int2)
+    if let Ok(v) = row.try_get::<_, i64>(name) {
+        return Ok(v as i32);
+    }
+    // Coba f64 (covers numeric, float8, float4)
+    if let Ok(v) = row.try_get::<_, f64>(name) {
+        return Ok(v as i32);
+    }
+    row.try_get::<_, i32>(name)
+        .with_context(|| format!("i32_col '{}' failed", name))
+}
+
 // ── Query helpers ─────────────────────────────────────────────────────────────
 
 pub async fn exec_drop(

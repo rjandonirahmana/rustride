@@ -45,7 +45,7 @@ ulid = "1.2.1"
 rand = "0.9"
 tracing = "0.1.44"
 deadpool-postgres = "0.14.1"
-tokio-postgres = { version = "0.7.17" }
+tokio-postgres = { version = "0.7.17", features = ["with-chrono-0_4"] }
 rust_decimal = { version = "1.41.0", features = ["tokio-postgres"] }
 rust_decimal_macros = "1.35"
 hex = "0.4"

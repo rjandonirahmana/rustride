@@ -1,10 +1,13 @@
+use super::db::{col_opt_str, exec_rows, f32_col, get_conn};
+use crate::{
+    repository::db::i32_col,
+    utils::ulid::{bin_to_ulid, id_to_vec},
+};
 use anyhow::Result;
 use async_trait::async_trait;
-use deadpool_postgres::Pool;
+use chrono::NaiveDate;
+use deadpool_postgres::{Pool, Status};
 use tokio_postgres::Row;
-
-use super::db::{col_opt_str, exec_rows, f32_col, get_conn};
-use crate::utils::ulid::{bin_to_ulid, id_to_vec};
 
 // ── Models ────────────────────────────────────────────────────────────────────
 
@@ -120,60 +123,67 @@ impl PgDriverRepository {
         Self { pool }
     }
 
-    // Ambil o.id sebagai BYTEA langsung — decode ke ULID via bin_to_ulid.
-    // Tidak pakai encode(o.id,'hex') di SQL.
     fn order_item_cols() -> &'static str {
         r#"
-            o.id                                                                AS order_id,
-            o.status,
-            COALESCE(u.name, '')                                                AS rider_name,
-            o.pickup_address,
-            o.dest_address,
-            COALESCE(o.distance_km::FLOAT8, 0)                                 AS distance_km,
-            COALESCE(EXTRACT(EPOCH FROM (o.completed_at - o.started_at))::INT / 60, 0) AS duration_min,
-            COALESCE(o.fare_final, o.fare_estimate)                             AS fare,
-            FLOOR(COALESCE(o.fare_final, o.fare_estimate) * 0.80)::BIGINT       AS driver_earning,
-            COALESCE(
-                (SELECT SUM(r.tip_amount) FROM ratings r
-                 WHERE r.order_id = o.id AND r.target_id = o.driver_id), 0
-            )::BIGINT                                                            AS tip,
-            o.service_type,
-            COALESCE(to_char(o.started_at   AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), '') AS started_at,
-            COALESCE(to_char(o.completed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), '') AS completed_at,
-            COALESCE(o.cancel_reason, '')                                        AS cancel_reason,
-            COALESCE(
-                (SELECT r.score::FLOAT8 FROM ratings r
-                 WHERE r.order_id = o.id AND r.target_id = o.driver_id LIMIT 1), 0
-            )                                                                    AS rating,
-            COALESCE(
-                (SELECT r.comment FROM ratings r
-                 WHERE r.order_id = o.id AND r.target_id = o.driver_id LIMIT 1), ''
-            )                                                                    AS rating_comment
-        "#
+        o.id                                                                AS order_id,
+        o.status,
+        COALESCE(u.name, '')                                                AS rider_name,
+        COALESCE(o.pickup_address, '')                                      AS pickup_address,
+        COALESCE(o.dest_address, '')                                        AS dest_address,
+        COALESCE(o.distance_km::FLOAT8, 0.0)                                  AS distance_km,
+        COALESCE(EXTRACT(EPOCH FROM (o.completed_at - o.started_at))::INT / 60, 0) AS duration_min,
+        COALESCE(o.fare_final, o.fare_estimate)::BIGINT AS fare,
+        FLOOR(COALESCE(o.fare_final, o.fare_estimate) * 0.80)::BIGINT       AS driver_earning,
+        COALESCE(
+            (SELECT SUM(r.tip_amount) FROM ratings r
+             WHERE r.order_id = o.id AND r.target_id = o.driver_id), 0
+        )::BIGINT                                                            AS tip,
+        o.service_type::TEXT AS service_type,
+        COALESCE(to_char(o.started_at   AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), '') AS started_at,
+        COALESCE(to_char(o.completed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), '') AS completed_at,
+        COALESCE(o.cancel_reason, '')                                        AS cancel_reason,
+        COALESCE(
+            (SELECT r.score::FLOAT8 FROM ratings r
+             WHERE r.order_id = o.id AND r.target_id = o.driver_id LIMIT 1), 0
+        )                                                                    AS rating,
+        COALESCE(
+            (SELECT r.comment FROM ratings r
+             WHERE r.order_id = o.id AND r.target_id = o.driver_id LIMIT 1), ''
+        )                                                                    AS rating_comment
+    "#
     }
 
     fn row_to_item(row: &Row) -> Result<DriverOrderItem> {
-        // order_id datang sebagai BYTEA langsung
         let id_bytes: Vec<u8> = row.try_get("order_id")?;
         let order_id = bin_to_ulid(id_bytes)?;
+
+        // Semua kolom teks sekarang tidak mungkin NULL karena COALESCE
+        let pickup_address: String = row.try_get("pickup_address")?;
+        let dest_address: String = row.try_get("dest_address")?;
+        let cancel_reason: String = row.try_get("cancel_reason")?;
+        let rating_comment: String = row.try_get("rating_comment")?;
+
+        let distance_km: f32 = row.try_get::<_, f64>("distance_km")? as f32;
+        let duration_min: i32 = row.try_get::<_, i32>("duration_min")?;
+        let rating: f32 = row.try_get::<_, f64>("rating")? as f32;
 
         Ok(DriverOrderItem {
             order_id,
             status: row.try_get("status")?,
             rider_name: row.try_get("rider_name")?,
-            pickup_address: row.try_get("pickup_address")?,
-            dest_address: row.try_get("dest_address")?,
-            distance_km: f32_col(row, "distance_km")?,
-            duration_min: row.try_get("duration_min")?,
+            pickup_address,
+            dest_address,
+            distance_km,
+            duration_min,
             fare: row.try_get("fare")?,
             driver_earning: row.try_get("driver_earning")?,
             tip: row.try_get("tip")?,
             service_type: row.try_get("service_type")?,
             started_at: row.try_get("started_at")?,
             completed_at: row.try_get("completed_at")?,
-            cancel_reason: row.try_get("cancel_reason")?,
-            rating: f32_col(row, "rating")?,
-            rating_comment: row.try_get("rating_comment")?,
+            cancel_reason,
+            rating,
+            rating_comment,
         })
     }
 }
@@ -235,6 +245,8 @@ impl DriverRepository for PgDriverRepository {
         driver_id: &str,
         filter: OrderHistoryFilter,
     ) -> Result<(Vec<DriverOrderItem>, u32)> {
+        use tokio_postgres::types::ToSql;
+
         let driver_b = id_to_vec(driver_id)?;
         let limit = (filter.limit.max(1).min(100)) as i64;
         let offset = (filter.page.saturating_sub(1) as i64) * limit;
@@ -243,91 +255,97 @@ impl DriverRepository for PgDriverRepository {
             "o.driver_id = $1".into(),
             "o.status IN ('completed','cancelled')".into(),
         ];
-        let mut param_idx = 2usize;
 
-        let mut date_from_str = String::new();
-        let mut date_to_str = String::new();
-        let mut status_str = String::new();
-        let mut svc_str = String::new();
+        let mut params: Vec<&(dyn ToSql + Sync)> = vec![&driver_b];
+        let mut param_idx = 2;
 
+        // date_from
         if let Some(ref df) = filter.date_from {
-            date_from_str = df.clone();
             where_parts.push(format!(
                 "DATE(COALESCE(o.completed_at, o.cancelled_at) AT TIME ZONE 'UTC') >= ${}",
                 param_idx
             ));
+            params.push(df);
             param_idx += 1;
         }
+
+        // date_to
         if let Some(ref dt) = filter.date_to {
-            date_to_str = dt.clone();
             where_parts.push(format!(
                 "DATE(COALESCE(o.completed_at, o.cancelled_at) AT TIME ZONE 'UTC') <= ${}",
                 param_idx
             ));
+            params.push(dt);
             param_idx += 1;
         }
+
+        // status
         if let Some(ref st) = filter.status {
-            status_str = st.clone();
             where_parts.push(format!("o.status = ${}", param_idx));
+            params.push(st);
             param_idx += 1;
         }
+
+        // service_type
         if let Some(ref svc) = filter.service_type {
-            svc_str = svc.clone();
-            where_parts.push(format!("o.service_type = ${}", param_idx));
+            where_parts.push(format!("o.service_type::TEXT = ${}", param_idx));
+            params.push(svc);
             param_idx += 1;
         }
 
         let where_sql = where_parts.join(" AND ");
 
-        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&driver_b];
-        if !date_from_str.is_empty() {
-            params.push(&date_from_str);
-        }
-        if !date_to_str.is_empty() {
-            params.push(&date_to_str);
-        }
-        if !status_str.is_empty() {
-            params.push(&status_str);
-        }
-        if !svc_str.is_empty() {
-            params.push(&svc_str);
-        }
+        let conn = get_conn(&self.pool).await?;
 
-        // COUNT
+        // ✅ COUNT
         let count_q = format!(
             "SELECT COUNT(*)::BIGINT AS cnt FROM orders o WHERE {}",
             where_sql
         );
-        let conn = get_conn(&self.pool).await?;
-        let count_rows = conn.query(&count_q, params.as_slice()).await?;
-        let total: i64 = count_rows
-            .first()
-            .and_then(|r| r.try_get("cnt").ok())
-            .unwrap_or(0);
 
-        // DATA
+        let count_row = conn.query_one(&count_q, params.as_slice()).await?;
+        let total: i64 = count_row.try_get("cnt")?;
+
+        // ✅ DATA
         let limit_idx = param_idx;
         let offset_idx = param_idx + 1;
+
         params.push(&limit);
         params.push(&offset);
 
         let data_q = format!(
             r#"SELECT {cols}
-               FROM orders o
-               LEFT JOIN users u ON u.id = o.rider_id
-               WHERE {where}
-               ORDER BY COALESCE(o.completed_at, o.cancelled_at) DESC
-               LIMIT ${limit_idx} OFFSET ${offset_idx}"#,
-            cols      = Self::order_item_cols(),
-            where     = where_sql,
+           FROM orders o
+           LEFT JOIN users u ON u.id = o.rider_id
+           WHERE {where}
+           ORDER BY COALESCE(o.completed_at, o.cancelled_at) DESC
+           LIMIT ${limit_idx} OFFSET ${offset_idx}"#,
+            cols = Self::order_item_cols(),
+            where = where_sql,
             limit_idx = limit_idx,
-            offset_idx= offset_idx,
+            offset_idx = offset_idx,
         );
-        let rows = conn.query(&data_q, params.as_slice()).await?;
-        let items = rows.iter().map(Self::row_to_item).collect::<Result<_>>()?;
+
+        let rows = match conn.query(&data_q, params.as_slice()).await {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    sql = %data_q,
+                    params_count = params.len(),
+                    "Database query failed"
+                );
+                return Err(e.into());
+            }
+        };
+
+        let items = rows
+            .iter()
+            .map(Self::row_to_item)
+            .collect::<Result<Vec<_>>>()?;
+
         Ok((items, total as u32))
     }
-
     async fn get_order_detail(
         &self,
         driver_id: &str,
@@ -376,6 +394,9 @@ impl DriverRepository for PgDriverRepository {
         let driver_b = id_to_vec(driver_id)?;
         let conn = get_conn(&self.pool).await?;
 
+        let df = NaiveDate::parse_from_str(date_from, "%Y-%m-%d")?;
+        let dt = NaiveDate::parse_from_str(date_to, "%Y-%m-%d")?;
+
         let agg = conn
             .query_one(
                 r#"SELECT
@@ -394,14 +415,14 @@ impl DriverRepository for PgDriverRepository {
                    FROM orders
                    WHERE driver_id = $1
                      AND DATE(COALESCE(completed_at, cancelled_at) AT TIME ZONE 'UTC') BETWEEN $2 AND $3"#,
-                &[&driver_b, &date_from, &date_to],
+                &[&driver_b, &df, &dt],
             )
             .await?;
 
         let online_minutes: i64 = conn
             .query_one(
                 "SELECT COALESCE(SUM(online_minutes), 0)::BIGINT AS om FROM driver_daily_summary WHERE driver_id=$1 AND summary_date BETWEEN $2 AND $3",
-                &[&driver_b, &date_from, &date_to],
+                &[&driver_b, &df, &dt],
             )
             .await?
             .try_get("om")?;
@@ -418,7 +439,7 @@ impl DriverRepository for PgDriverRepository {
                      AND DATE(COALESCE(completed_at, cancelled_at) AT TIME ZONE 'UTC') BETWEEN $2 AND $3
                    GROUP BY DATE(COALESCE(completed_at, cancelled_at) AT TIME ZONE 'UTC')
                    ORDER BY 1 ASC"#,
-                &[&driver_b, &date_from, &date_to],
+                &[&driver_b, &df, &dt],
             )
             .await?;
 

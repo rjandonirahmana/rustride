@@ -525,13 +525,20 @@ impl ConnectionManager {
         cancel.cancel();
         self.sessions.remove(user_id);
 
-        // FIX-3: pakai redis_ops
+        // FIX-3: pakai redis_ops, tapi dengan timeout agar tidak blocking
         let mut conn = self.redis_ops.clone();
-        if let Err(e) = conn.del::<_, ()>(format!("online:{}", user_id)).await {
-            tracing::warn!(user_id, "Failed to del presence: {}", e);
-        }
+        let key = format!("online:{}", user_id);
+        let uid = user_id.to_string();
+        tokio::spawn(async move {
+            match tokio::time::timeout(tokio::time::Duration::from_secs(1), conn.del::<_, ()>(&key))
+                .await
+            {
+                Ok(Ok(_)) => tracing::debug!(uid, "Presence key deleted"),
+                Ok(Err(e)) => tracing::warn!(uid, "Failed to del presence: {}", e),
+                Err(_) => tracing::warn!(uid, "Timeout deleting presence key"),
+            }
+        });
     }
-
     // ── Send ──────────────────────────────────────────────────────────────────
 
     pub fn send(&self, user_id: &str, event: Arc<ServerEvent>, priority: Priority) {
