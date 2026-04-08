@@ -204,6 +204,7 @@ mod auth_tests {
 mod order_service_tests {
     use anyhow::Result;
     use async_trait::async_trait;
+    use chrono::DateTime;
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -240,8 +241,11 @@ mod order_service_tests {
             fare_estimate: 15_000,
             fare_final: None,
             service_type: "motor".into(),
-            created_at: "2024-01-01T00:00:00Z".into(),
+            created_at: DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+                .unwrap()
+                .into(),
             rider_name: "Budi".into(),
+            driver_name: Some("unad".to_string()),
         }
     }
 

@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,8 +21,9 @@ pub struct Order {
     pub fare_final: Option<i32>,
     pub service_type: String, // "motor" | "mobil"
 
-    pub created_at: String, // ISO-8601
+    pub created_at: DateTime<Utc>, // ISO-8601
     pub rider_name: String,
+    pub driver_name: Option<String>,
 }
 
 /// Helper: order + jarak dari posisi driver ke pickup

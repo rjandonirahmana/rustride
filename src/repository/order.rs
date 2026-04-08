@@ -73,8 +73,8 @@ impl PgOrderRepository {
        o.distance_km::FLOAT8 AS distance_km,
        o.fare_estimate, o.fare_final,
        o.service_type::TEXT AS service_type,
-       to_char(o.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at_fmt,
-       u.name AS rider_name"#
+       o.created_at AS created_at,
+       u.name AS rider_name, u2.name AS driver_name"#
     }
 
     fn row_to_order(row: &Row) -> Result<Order> {
@@ -97,8 +97,9 @@ impl PgOrderRepository {
             fare_estimate: row.try_get("fare_estimate")?,
             fare_final: col_opt_i32(row, "fare_final"),
             service_type: row.try_get("service_type")?,
-            created_at: row.try_get("created_at_fmt")?,
+            created_at: row.try_get("created_at")?,
             rider_name: row.try_get("rider_name")?,
+            driver_name: row.try_get("driver_name")?,
         })
     }
 }
@@ -152,7 +153,7 @@ impl OrderRepository for PgOrderRepository {
     async fn find_by_id(&self, id: &str) -> Result<Option<Order>> {
         let id_b = id_to_vec(id)?;
         let q = format!(
-            "SELECT {} FROM orders o JOIN users u ON o.rider_id = u.id WHERE o.id = $1",
+            "SELECT {} FROM orders o JOIN users u ON o.rider_id = u.id LEFT JOIN users u2 ON o.driver_id = u2.id WHERE o.id = $1",
             Self::order_cols()
         );
         exec_first(&self.pool, &q, &[&id_b])
@@ -165,7 +166,8 @@ impl OrderRepository for PgOrderRepository {
         let rider_bytes = id_to_vec(rider_id)?;
         let q = format!(
             "SELECT {} FROM orders o JOIN users u ON o.rider_id = u.id
-             WHERE o.rider_id = $1 AND o.status NOT IN ('cancelled','completed') LIMIT 1",
+            LEFT JOIN users u2 ON o.driver_id = u2.id
+            WHERE o.rider_id = $1 AND o.status NOT IN ('cancelled','completed') LIMIT 1",
             Self::order_cols()
         );
         exec_first(&self.pool, &q, &[&rider_bytes])
@@ -178,7 +180,8 @@ impl OrderRepository for PgOrderRepository {
         let driver_bytes = id_to_vec(driver_id)?;
         let q = format!(
             "SELECT {} FROM orders o JOIN users u ON o.rider_id = u.id
-             WHERE o.driver_id = $1 AND o.status NOT IN ('cancelled','completed') LIMIT 1",
+            LEFT JOIN users u2 ON o.driver_id = u2.id
+            WHERE o.driver_id = $1 AND o.status NOT IN ('cancelled','completed') LIMIT 1",
             Self::order_cols()
         );
         exec_first(&self.pool, &q, &[&driver_bytes])
@@ -192,8 +195,9 @@ impl OrderRepository for PgOrderRepository {
         let driver_bytes = id_to_vec(driver_id)?;
         let q = format!(
             "SELECT {} FROM orders o JOIN users u ON o.rider_id = u.id
+             LEFT JOIN users u2 ON o.driver_id = u2.id
              WHERE o.rider_id = $1 AND o.driver_id = $2
-               AND o.status IN ('driver_accepted','driver_arrived','on_trip') LIMIT 1",
+            AND o.status IN ('driver_accepted','driver_arrived','on_trip') LIMIT 1",
             Self::order_cols()
         );
         exec_first(&self.pool, &q, &[&rider_bytes, &driver_bytes])
@@ -219,6 +223,7 @@ impl OrderRepository for PgOrderRepository {
         let lng_delta = radius_km / (111.0 * lat.to_radians().cos());
         let q = format!(
             r#"SELECT {} FROM orders o JOIN users u ON o.rider_id = u.id
+                LEFT JOIN users u2 ON o.driver_id = u2.id
                WHERE o.status = 'searching'
                  AND o.service_type::TEXT = $1 
                  AND o.pickup_lat::FLOAT8 BETWEEN $2 AND $3
@@ -304,7 +309,8 @@ impl OrderRepository for PgOrderRepository {
         let user_b = id_to_vec(user_id)?;
         let q = format!(
             "SELECT {} FROM orders o JOIN users u ON o.rider_id = u.id
-             WHERE o.rider_id = $1 ORDER BY o.created_at DESC LIMIT $2",
+            LEFT JOIN users u2 ON o.driver_id = u2.id
+            WHERE o.rider_id = $1 ORDER BY o.created_at DESC LIMIT $2",
             Self::order_cols()
         );
         let rows = exec_rows(&self.pool, &q, &[&user_b, &limit]).await?;

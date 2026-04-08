@@ -142,7 +142,7 @@ impl<OR: OrderRepository + 'static, UR: UserRepository + 'static> OrderServiceGr
                 dest_address: order.dest_address,
                 fare_estimate: order.fare_estimate,
                 service_type: order.service_type,
-                created_at: order.created_at,
+                created_at: order.created_at.to_rfc3339(),
                 driver: driver_info,
             }),
         }))
@@ -291,7 +291,7 @@ pub async fn handle_browse_orders<OR, UR, RR, NR>(
                         dest_lng: o.dest_lng,
                         fare_estimate: o.fare_estimate,
                         service_type: o.service_type,
-                        created_at: o.created_at,
+                        created_at: o.created_at.to_rfc3339(),
                         driver: None,
                     }),
                 }),

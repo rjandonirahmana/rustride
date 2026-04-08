@@ -85,16 +85,13 @@ async fn main() -> anyhow::Result<()> {
     cfgpostgres_poi.url = Some(cfg.database_url_poi);
     let poi_pool = cfgpostgres_poi.create_pool(Some(Runtime::Tokio1), NoTls)?;
 
-    let _conn_poi = poi_pool.clone().get().await?;
-    tracing::info!("PostgreSQL POI connected");
-
     // ── Redis ─────────────────────────────────────────────────────────────────
     let redis_client = redis::Client::open(cfg.redis_url.as_str())?;
     let redis_conn = redis::aio::ConnectionManager::new_with_config(
         redis_client.clone(),
         redis::aio::ConnectionManagerConfig::new()
-            .set_response_timeout(Some(std::time::Duration::from_secs(5)))
-            .set_connection_timeout(Some(std::time::Duration::from_secs(5)))
+            .set_response_timeout(Some(std::time::Duration::from_secs(10)))
+            .set_connection_timeout(Some(std::time::Duration::from_secs(10)))
             .set_number_of_retries(3),
     )
     .await?;

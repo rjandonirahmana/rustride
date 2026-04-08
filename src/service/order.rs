@@ -72,7 +72,7 @@ pub fn order_to_proto(o: &Order) -> crate::proto::order::Order {
         dest_address: o.dest_address.clone(),
         fare_estimate: o.fare_estimate,
         service_type: o.service_type.clone(),
-        created_at: o.created_at.clone(),
+        created_at: o.created_at.clone().to_rfc3339(),
         driver: None, // diisi terpisah oleh caller yang punya akses user_repo
     }
 }

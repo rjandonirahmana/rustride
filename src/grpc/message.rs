@@ -72,8 +72,8 @@ impl<OR: OrderRepository + 'static> MessageService for MessageServiceImpl<OR> {
             return Err(Status::failed_precondition("Order tidak aktif"));
         }
 
-        // ambil username dari order / fallback ke user_id
-        let username = order.rider_name.clone(); // atau fetch dari user_repo kalau perlu
+        let username: String = get_peer_name_from_order(&user_id, &order)
+            .map_err(|e| Status::permission_denied(&e.to_string()))?;
 
         let msg = self
             .chat_svc
@@ -124,11 +124,12 @@ impl<OR: OrderRepository + 'static> MessageService for MessageServiceImpl<OR> {
             return Err(Status::permission_denied("Recipient mismatch"));
         }
 
+        let username: String = get_peer_name_from_order(&user_id, &order)
+            .map_err(|e| Status::permission_denied(&e.to_string()))?;
+
         if !is_order_active(&order.status) {
             return Err(Status::failed_precondition("Order tidak aktif"));
         }
-
-        let username = order.rider_name.clone();
 
         let result = self
             .chat_svc
@@ -255,6 +256,21 @@ fn get_peer_id_from_order(
     }
 }
 
+fn get_peer_name_from_order(
+    user_id: &str,
+    order: &crate::models::order::Order,
+) -> anyhow::Result<String> {
+    if order.rider_id == user_id {
+        order
+            .driver_name
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Driver belum assigned"))
+    } else if order.driver_id.as_deref() == Some(user_id) {
+        Ok(order.rider_name.clone())
+    } else {
+        Err(anyhow::anyhow!("User bukan rider/driver dari order ini"))
+    }
+}
 fn is_order_active(status: &str) -> bool {
     !matches!(status, "completed" | "cancelled" | "searching")
 }

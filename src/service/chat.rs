@@ -52,7 +52,7 @@ impl ChatService {
             delivered_at: None,
             read_at: None,
             sender_avatar: None,
-            sender_name: None,
+            sender_name: Some(sender.to_string()),
             order_id: order_id.to_string(),
             status_order: None,
         };
@@ -87,7 +87,7 @@ impl ChatService {
             id: new_ulid(),
             sender_id: sender_id.to_string(),
             recipient_id: recipient_id.to_string(),
-            content: "".to_string(),
+            content: String::new(),
             msg_type: msg_type.to_string(),
             media_url: Some(media_url.to_string()),
             media_mime: Some(media_mime.to_string()),
@@ -98,14 +98,13 @@ impl ChatService {
             delivered_at: None,
             read_at: None,
             sender_avatar: None,
-            sender_name: None,
+            sender_name: Some(sender.to_string()),
             order_id: order_id.to_string(),
             status_order: None,
         };
 
         self.msg_repo.save(&mut msg).await?;
         self.push_message(&msg, sender).await;
-
         Ok(msg)
     }
 
@@ -118,7 +117,6 @@ impl ChatService {
             _ => "bin",
         };
 
-        // ULID string langsung dipakai di path — sortable by time, URL-safe
         let file_id = new_ulid();
         let key = format!("chat/{}/{}.{}", user_id, file_id, ext);
 
@@ -141,13 +139,13 @@ impl ChatService {
         self.msg_repo.get_conversations(user_id).await
     }
 
-    /// Mark pesan dari sender sebagai sudah dibaca
+    /// Mark pesan dari sender sebagai sudah dibaca, lalu notify sender
     pub async fn mark_read(&self, reader_id: &str, sender_id: &str) -> Result<()> {
         self.msg_repo.mark_read(reader_id, sender_id).await?;
 
-        let read_at = chrono::Utc::now()
-            .format("%Y-%m-%d %H:%M:%S%.3f")
-            .to_string();
+        let read_at = chrono::Utc::now().to_rfc3339();
+
+        // Kirim ReadReceipt ke sender pesan agar UI-nya update centang biru
         self.connections.send(
             sender_id,
             Arc::new(ServerEvent {
@@ -158,6 +156,7 @@ impl ChatService {
             }),
             Priority::Normal,
         );
+
         Ok(())
     }
 
@@ -169,7 +168,7 @@ impl ChatService {
         limit: i32,
         before: Option<&str>,
     ) -> Result<Vec<Message>> {
-        let limit = if limit <= 0 || limit > 100 { 50 } else { limit };
+        let limit = limit.clamp(1, 100);
         self.msg_repo
             .get_history(user_id, peer_id, limit, before)
             .await
@@ -178,7 +177,7 @@ impl ChatService {
     // ── Internal ──────────────────────────────────────────────────────────────
 
     async fn push_message(&self, msg: &Message, sender_name: &str) {
-        let event = ServerEvent {
+        let event = Arc::new(ServerEvent {
             payload: Some(Sp::NewMessage(NewMessageEvent {
                 msg_id: msg.id.clone(),
                 sender_id: msg.sender_id.clone(),
@@ -186,7 +185,7 @@ impl ChatService {
                 recipient_id: msg.recipient_id.clone(),
                 content: msg.content.clone(),
                 msg_type: msg.msg_type.clone(),
-                sent_at: msg.sent_at.clone().to_rfc3339(),
+                sent_at: msg.sent_at.to_rfc3339(),
                 media_url: msg.media_url.clone().unwrap_or_default(),
                 media_mime: msg.media_mime.clone().unwrap_or_default(),
                 media_size: msg.media_size.unwrap_or(0),
@@ -195,20 +194,47 @@ impl ChatService {
                 sender_avatar: msg.sender_avatar.clone().unwrap_or_default(),
                 status_order: msg.status_order.clone().unwrap_or_default(),
             })),
-        };
+        });
 
-        self.connections.send(
-            &msg.recipient_id,
-            Arc::new(event.clone()),
-            Priority::Critical,
-        );
-
+        // ── Push ke recipient ─────────────────────────────────────────────────
+        //
+        // BUG LAMA 1: send() dipanggil SEBELUM is_connected check
+        //   → pesan di-push ke koneksi yang belum tentu ada, error diabaikan
+        //
+        // BUG LAMA 2: match Ok(_) { ... } menangkap Ok(false) juga
+        //   → mark_delivered dipanggil meski recipient sedang offline
+        //
+        // FIX: cek is_connected dulu → kalau Ok(true) baru send + mark_delivered
         match self.connections.is_connected(&msg.recipient_id).await {
-            Ok(_) => {
-                let _ = self.msg_repo.mark_delivered(&msg.id).await;
+            Ok(true) => {
+                self.connections
+                    .send(&msg.recipient_id, Arc::clone(&event), Priority::Normal);
+
+                // Mark delivered hanya setelah event berhasil dikirim ke koneksi aktif
+                if let Err(e) = self.msg_repo.mark_delivered(&msg.id).await {
+                    tracing::warn!(
+                        msg_id = %msg.id,
+                        error  = %e,
+                        "mark_delivered failed"
+                    );
+                }
+            }
+            Ok(false) => {
+                // Recipient offline — pesan tersimpan di DB,
+                // akan di-deliver saat reconnect via getCurrentOrder / stream reconnect
+                tracing::debug!(
+                    msg_id       = %msg.id,
+                    recipient_id = %msg.recipient_id,
+                    "Recipient offline, message queued"
+                );
             }
             Err(e) => {
-                tracing::info!("errror {:?}", e)
+                tracing::warn!(
+                    msg_id       = %msg.id,
+                    recipient_id = %msg.recipient_id,
+                    error        = %e,
+                    "is_connected check failed"
+                );
             }
         }
     }

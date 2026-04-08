@@ -31,15 +31,6 @@ pub async fn handle_location_update<OR, UR, RR, NR>(
         return;
     }
 
-    tracing::info!(
-        driver = %ctx.user_id,
-        lat = loc.lat,
-        lng = loc.lng,
-        heading = loc.heading,
-        speed = loc.speed,
-        "Received location update"
-    );
-
     // Throttle: heartbeat tidak perlu lebih dari 1x/detik
     if !ctx
         .throttle
@@ -47,14 +38,6 @@ pub async fn handle_location_update<OR, UR, RR, NR>(
     {
         return; // Silently drop — client tidak perlu tahu
     }
-
-    tracing::info!(
-        driver = %ctx.user_id,
-        vehicle_type = %ctx.vehicle_type,
-        lat = loc.lat,
-        lng = loc.lng,
-        "Location update lolos throttle, update Redis"
-    );
 
     if let Err(e) = ctx
         .location
@@ -86,6 +69,7 @@ pub async fn handle_location_update<OR, UR, RR, NR>(
         .await
     {
         Ok(Some(order)) => {
+            tracing::info!("kirim driver loc ke {:?}", &order.rider_id);
             ctx.connections.send(
                 &order.rider_id,
                 Arc::new(ServerEvent {
