@@ -84,7 +84,7 @@ impl<OR: OrderRepository + 'static> MessageService for MessageServiceImpl<OR> {
         Ok(Response::new(MessageAckEvent {
             msg_id: msg.id,
             status: "sent".into(),
-            sent_at: msg.sent_at,
+            sent_at: msg.sent_at.to_rfc3339(),
         }))
     }
 
@@ -186,7 +186,7 @@ impl<OR: OrderRepository + 'static> MessageService for MessageServiceImpl<OR> {
                 recipient_id: m.recipient_id,
                 content: m.content,
                 msg_type: m.msg_type,
-                sent_at: m.sent_at,
+                sent_at: m.sent_at.to_rfc3339(),
                 media_url: m.media_url.unwrap_or_default(),
                 media_mime: m.media_mime.unwrap_or_default(),
                 media_size: m.media_size.unwrap_or(0),

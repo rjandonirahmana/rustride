@@ -4,7 +4,7 @@ use deadpool_postgres::Pool;
 use tokio_postgres::Row;
 
 use super::db::{col_opt_str, exec_drop, exec_first, exec_rows};
-use crate::utils::ulid::{bin_to_ulid, bin_to_ulid_opt, id_to_vec, ulid_to_vec};
+use crate::utils::ulid::{bin_to_ulid, bin_to_ulid_opt, id_to_vec};
 
 // ── notifications.id adalah GENERATED ALWAYS AS IDENTITY ─────────────────────
 // Tidak boleh insert id manual — PostgreSQL generate sendiri.

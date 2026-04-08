@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use deadpool_postgres::Pool;
 
-use super::db::{col_opt_str, exec_drop, exec_first, exec_rows, f32_col, get_conn};
+use super::db::{col_opt_str, exec_drop, exec_first, get_conn};
 use crate::{
     models::user::{DriverProfile, RegisterRequest, User},
     utils::ulid::{bin_to_ulid, id_to_vec, new_ulid, ulid_to_vec},

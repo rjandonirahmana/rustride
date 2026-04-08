@@ -48,9 +48,7 @@ impl ChatService {
             media_size: None,
             media_duration: None,
             media_thumb: None,
-            sent_at: chrono::Utc::now()
-                .format("%Y-%m-%d %H:%M:%S%.3f")
-                .to_string(),
+            sent_at: chrono::Utc::now(),
             delivered_at: None,
             read_at: None,
             sender_avatar: None,
@@ -96,9 +94,7 @@ impl ChatService {
             media_size: Some(media_size),
             media_duration: None,
             media_thumb: None,
-            sent_at: chrono::Utc::now()
-                .format("%Y-%m-%d %H:%M:%S%.3f")
-                .to_string(),
+            sent_at: chrono::Utc::now(),
             delivered_at: None,
             read_at: None,
             sender_avatar: None,
@@ -190,7 +186,7 @@ impl ChatService {
                 recipient_id: msg.recipient_id.clone(),
                 content: msg.content.clone(),
                 msg_type: msg.msg_type.clone(),
-                sent_at: msg.sent_at.clone(),
+                sent_at: msg.sent_at.clone().to_rfc3339(),
                 media_url: msg.media_url.clone().unwrap_or_default(),
                 media_mime: msg.media_mime.clone().unwrap_or_default(),
                 media_size: msg.media_size.unwrap_or(0),

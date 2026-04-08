@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -13,9 +14,9 @@ pub struct Message {
     pub media_size: Option<i64>,
     pub media_duration: Option<i32>,
     pub media_thumb: Option<String>,
-    pub sent_at: String,
-    pub delivered_at: Option<String>,
-    pub read_at: Option<String>,
+    pub sent_at: DateTime<Utc>,              // ← langsung DateTime
+    pub delivered_at: Option<DateTime<Utc>>, // ← Option
+    pub read_at: Option<DateTime<Utc>>,      // ← Option
     pub sender_name: Option<String>,
     pub sender_avatar: Option<String>,
     pub status_order: Option<String>,

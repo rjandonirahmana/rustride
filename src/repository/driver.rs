@@ -1,12 +1,9 @@
-use super::db::{col_opt_str, exec_rows, f32_col, get_conn};
-use crate::{
-    repository::db::i32_col,
-    utils::ulid::{bin_to_ulid, id_to_vec},
-};
+use super::db::{exec_rows, f32_col, get_conn};
+use crate::utils::ulid::{bin_to_ulid, id_to_vec};
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::NaiveDate;
-use deadpool_postgres::{Pool, Status};
+use deadpool_postgres::Pool;
 use tokio_postgres::Row;
 
 // ── Models ────────────────────────────────────────────────────────────────────
