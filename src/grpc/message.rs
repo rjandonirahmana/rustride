@@ -60,7 +60,6 @@ impl<OR: OrderRepository + 'static> MessageService for MessageServiceImpl<OR> {
             .map_err(|e| internal(&e.to_string()))?
             .ok_or_else(|| Status::not_found("Order tidak ditemukan"))?;
 
-        // validasi peer
         let peer_id = get_peer_id_from_order(&user_id, &order)
             .map_err(|e| Status::permission_denied(&e.to_string()))?;
 
@@ -72,12 +71,14 @@ impl<OR: OrderRepository + 'static> MessageService for MessageServiceImpl<OR> {
             return Err(Status::failed_precondition("Order tidak aktif"));
         }
 
-        let username: String = get_peer_name_from_order(&user_id, &order)
+        // FIX: gunakan get_sender_name, bukan get_peer_name.
+        // get_peer_name mengembalikan nama lawan bicara, bukan nama pengirim.
+        let sender_name = get_sender_name_from_order(&user_id, &order)
             .map_err(|e| Status::permission_denied(&e.to_string()))?;
 
         let msg = self
             .chat_svc
-            .send_text(&user_id, &peer_id, &m.content, &username, &m.order_id)
+            .send_text(&user_id, &peer_id, &m.content, &sender_name, &m.order_id)
             .await
             .map_err(|e| internal(&e.to_string()))?;
 
@@ -124,12 +125,13 @@ impl<OR: OrderRepository + 'static> MessageService for MessageServiceImpl<OR> {
             return Err(Status::permission_denied("Recipient mismatch"));
         }
 
-        let username: String = get_peer_name_from_order(&user_id, &order)
-            .map_err(|e| Status::permission_denied(&e.to_string()))?;
-
         if !is_order_active(&order.status) {
             return Err(Status::failed_precondition("Order tidak aktif"));
         }
+
+        // FIX: sama seperti send_message — pakai nama pengirim, bukan peer
+        let sender_name = get_sender_name_from_order(&user_id, &order)
+            .map_err(|e| Status::permission_denied(&e.to_string()))?;
 
         let result = self
             .chat_svc
@@ -139,7 +141,7 @@ impl<OR: OrderRepository + 'static> MessageService for MessageServiceImpl<OR> {
                 &m.media_url,
                 &m.media_mime,
                 m.media_size,
-                &username,
+                &sender_name,
                 &m.order_id,
             )
             .await
@@ -171,13 +173,16 @@ impl<OR: OrderRepository + 'static> MessageService for MessageServiceImpl<OR> {
         let h = req.into_inner();
 
         let before = (!h.before.is_empty()).then_some(h.before.as_str());
-        let msgs = self
+
+        // FIX: get_history sekarang return (Vec<Message>, bool) untuk has_more
+        // yang akurat. Sebelumnya has_more dihitung dari msgs.len() == limit
+        // yang bisa false-positive maupun false-negative.
+        let (msgs, has_more) = self
             .chat_svc
             .get_history(&user_id, &h.peer_id, h.limit, before)
             .await
             .map_err(|e| internal(&e.to_string()))?;
 
-        let has_more = msgs.len() as i32 == h.limit;
         let items = msgs
             .into_iter()
             .map(|m| NewMessageEvent {
@@ -239,7 +244,8 @@ impl<OR: OrderRepository + 'static> MessageService for MessageServiceImpl<OR> {
     }
 }
 
-// helper lokal — sama logikanya dengan trip_service tapi tanpa username context
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
 fn get_peer_id_from_order(
     user_id: &str,
     order: &crate::models::order::Order,
@@ -256,6 +262,25 @@ fn get_peer_id_from_order(
     }
 }
 
+/// Nama si pengirim — kebalikan dari get_peer_id_from_order.
+/// Rider kirim → nama rider. Driver kirim → nama driver.
+fn get_sender_name_from_order(
+    user_id: &str,
+    order: &crate::models::order::Order,
+) -> anyhow::Result<String> {
+    if order.rider_id == user_id {
+        Ok(order.rider_name.clone())
+    } else if order.driver_id.as_deref() == Some(user_id) {
+        order
+            .driver_name
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Driver belum assigned"))
+    } else {
+        Err(anyhow::anyhow!("User bukan rider/driver dari order ini"))
+    }
+}
+
+// Fungsi lama dipertahankan untuk keperluan lain (misal: notifikasi nama penerima)
 fn get_peer_name_from_order(
     user_id: &str,
     order: &crate::models::order::Order,
@@ -271,6 +296,7 @@ fn get_peer_name_from_order(
         Err(anyhow::anyhow!("User bukan rider/driver dari order ini"))
     }
 }
+
 fn is_order_active(status: &str) -> bool {
     !matches!(status, "completed" | "cancelled" | "searching")
 }

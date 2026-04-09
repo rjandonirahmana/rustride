@@ -30,7 +30,7 @@ impl ChatService {
         sender_id: &str,
         recipient_id: &str,
         content: &str,
-        sender: &str,
+        sender_name: &str,
         order_id: &str,
     ) -> Result<Message> {
         if sender_id == recipient_id {
@@ -52,13 +52,13 @@ impl ChatService {
             delivered_at: None,
             read_at: None,
             sender_avatar: None,
-            sender_name: Some(sender.to_string()),
+            sender_name: Some(sender_name.to_string()),
             order_id: order_id.to_string(),
             status_order: None,
         };
 
         self.msg_repo.save(&mut msg).await?;
-        self.push_message(&msg, sender).await;
+        self.push_message(&msg, sender_name).await;
         Ok(msg)
     }
 
@@ -70,7 +70,7 @@ impl ChatService {
         media_url: &str,
         media_mime: &str,
         media_size: i64,
-        sender: &str,
+        sender_name: &str,
         order_id: &str,
     ) -> Result<Message> {
         if sender_id == recipient_id {
@@ -98,13 +98,13 @@ impl ChatService {
             delivered_at: None,
             read_at: None,
             sender_avatar: None,
-            sender_name: Some(sender.to_string()),
+            sender_name: Some(sender_name.to_string()),
             order_id: order_id.to_string(),
             status_order: None,
         };
 
         self.msg_repo.save(&mut msg).await?;
-        self.push_message(&msg, sender).await;
+        self.push_message(&msg, sender_name).await;
         Ok(msg)
     }
 
@@ -145,7 +145,6 @@ impl ChatService {
 
         let read_at = chrono::Utc::now().to_rfc3339();
 
-        // Kirim ReadReceipt ke sender pesan agar UI-nya update centang biru
         self.connections.send(
             sender_id,
             Arc::new(ServerEvent {
@@ -160,15 +159,16 @@ impl ChatService {
         Ok(())
     }
 
-    /// Ambil history pesan antara dua user
+    /// Ambil history pesan antara dua user.
+    /// Return: (messages, has_more)
     pub async fn get_history(
         &self,
         user_id: &str,
         peer_id: &str,
         limit: i32,
         before: Option<&str>,
-    ) -> Result<Vec<Message>> {
-        let limit = limit.clamp(1, 100);
+    ) -> Result<(Vec<Message>, bool)> {
+        let limit = (limit as i64).clamp(1, 100);
         self.msg_repo
             .get_history(user_id, peer_id, limit, before)
             .await
@@ -196,21 +196,11 @@ impl ChatService {
             })),
         });
 
-        // ── Push ke recipient ─────────────────────────────────────────────────
-        //
-        // BUG LAMA 1: send() dipanggil SEBELUM is_connected check
-        //   → pesan di-push ke koneksi yang belum tentu ada, error diabaikan
-        //
-        // BUG LAMA 2: match Ok(_) { ... } menangkap Ok(false) juga
-        //   → mark_delivered dipanggil meski recipient sedang offline
-        //
-        // FIX: cek is_connected dulu → kalau Ok(true) baru send + mark_delivered
         match self.connections.is_connected(&msg.recipient_id).await {
             Ok(true) => {
                 self.connections
                     .send(&msg.recipient_id, Arc::clone(&event), Priority::Normal);
 
-                // Mark delivered hanya setelah event berhasil dikirim ke koneksi aktif
                 if let Err(e) = self.msg_repo.mark_delivered(&msg.id).await {
                     tracing::warn!(
                         msg_id = %msg.id,
@@ -220,8 +210,6 @@ impl ChatService {
                 }
             }
             Ok(false) => {
-                // Recipient offline — pesan tersimpan di DB,
-                // akan di-deliver saat reconnect via getCurrentOrder / stream reconnect
                 tracing::debug!(
                     msg_id       = %msg.id,
                     recipient_id = %msg.recipient_id,
